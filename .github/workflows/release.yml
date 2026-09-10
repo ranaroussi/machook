@@ -74,9 +74,7 @@ jobs:
           if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF" ]; then
             VERSION="0.0.0-dev"
           fi
-          BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' src/Info.plist)"
-          echo "version=$VERSION"             >> "$GITHUB_OUTPUT"
-          echo "build_number=$BUILD_NUMBER"   >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       # cloudflared is fetched by create-app-bundle.sh, which downloads both
       # macOS slices and lipos them. Doing it there rather than here keeps one
@@ -250,6 +248,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     env:
       SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+      SPARKLE_ED_PUBLIC_KEY: ${{ secrets.SPARKLE_ED_PUBLIC_KEY }}
     steps:
       - name: Verify Sparkle private key is configured
         run: |
@@ -273,13 +272,61 @@ jobs:
         with:
           path: artifacts
 
-      - name: Resolve version + build number
+      - name: Read version out of the built app
         id: meta
+        # Read the versions from the ZIP we are about to sign, never from
+        # src/Info.plist. Sparkle checks the appcast's <sparkle:version>
+        # against the installed app's CFBundleVersion, so if these two are
+        # derived from different places they drift and the updater concludes
+        # every user is already up to date. Describing the artifact makes that
+        # class of bug impossible, and the tag/bundle mismatch check below
+        # catches a broken APP_VERSION hand-off instead of shipping it.
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' src/Info.plist)"
-          echo "version=$VERSION"             >> "$GITHUB_OUTPUT"
-          echo "build_number=$BUILD_NUMBER"   >> "$GITHUB_OUTPUT"
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          ZIP="$(find artifacts -name 'machook-universal.zip' | head -1)"
+          if [ -z "$ZIP" ]; then
+            echo "::error::machook-universal.zip not found in artifacts."
+            find artifacts -type f | head -20
+            exit 1
+          fi
+
+          workdir="$(mktemp -d)"
+          ditto -x -k "$ZIP" "$workdir"
+          plist="$workdir/Machook.app/Contents/Info.plist"
+          if [ ! -f "$plist" ]; then
+            echo "::error::no Machook.app/Contents/Info.plist inside $ZIP"
+            find "$workdir" -maxdepth 2 | head -20
+            exit 1
+          fi
+
+          SHORT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
+          BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")"
+          echo "tag=$TAG_VERSION  bundle short=$SHORT_VERSION  bundle CFBundleVersion=$BUILD_NUMBER"
+
+          if [ "$SHORT_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::tag v$TAG_VERSION but the bundle says $SHORT_VERSION — the version never reached create-app-bundle.sh."
+            exit 1
+          fi
+
+          # The app can only install an update whose signature verifies against
+          # the key baked into the copy already on disk. If the shipped key and
+          # the signing key ever drift apart, every download is rejected at the
+          # last moment with nothing in the release log to explain it — so
+          # compare them here, while we can still fail the release instead.
+          SHIPPED_KEY="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$plist" 2>/dev/null || echo '')"
+          if [ -z "$SHIPPED_KEY" ]; then
+            echo "::error::the built app has no SUPublicEDKey — it could never verify an update."
+            exit 1
+          fi
+          if [ -n "$SPARKLE_ED_PUBLIC_KEY" ] && [ "$SHIPPED_KEY" != "$SPARKLE_ED_PUBLIC_KEY" ]; then
+            echo "::error::the app ships a different Sparkle public key than the SPARKLE_ED_PUBLIC_KEY secret."
+            echo "::error::src/Info.plist and the repository secrets disagree; updates signed here would be rejected."
+            exit 1
+          fi
+
+          echo "version=$SHORT_VERSION"      >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER"  >> "$GITHUB_OUTPUT"
+          echo "zip=$ZIP"                    >> "$GITHUB_OUTPUT"
 
       - name: Build Sparkle helpers (need sign_update binary)
         run: |
@@ -293,12 +340,7 @@ jobs:
           # universal ZIP: this one URL is correct for every Mac that can run
           # the app. The signature is computed over that same ZIP, so the file
           # Sparkle downloads is byte-identical to the one published here.
-          ZIP="$(find artifacts -name 'machook-universal.zip' | head -1)"
-          if [ -z "$ZIP" ]; then
-            echo "::error::machook-universal.zip not found in artifacts — nothing to sign."
-            find artifacts -type f | head -20
-            exit 1
-          fi
+          ZIP="${{ steps.meta.outputs.zip }}"
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
           NOTES_URL="https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
 

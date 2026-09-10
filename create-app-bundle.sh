@@ -264,22 +264,35 @@ done
 log "Installing Info.plist"
 cp "$SRC_DIR/Info.plist" "$APP_DIR/Contents/"
 
+# Releases pass APP_VERSION from the tag. Everything else is a development
+# build and takes the baseline declared in src/Info.plist.
+#
+# Deliberately *not* falling back to `git describe --tags`: that makes a local
+# build claim to be the latest release, so the updater sees nothing newer and a
+# dev build can never test the update path. A hardcoded literal here is worse
+# still — it goes stale silently and outranks the plist it's meant to mirror.
 VERSION="${APP_VERSION:-}"
 if [ -z "$VERSION" ]; then
-    VERSION="$(git -C "$PROJECT_DIR" describe --tags --abbrev=0 2>/dev/null || echo 0.1.0)"
-    VERSION="${VERSION#v}"
+    VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SRC_DIR/Info.plist" 2>/dev/null || echo '')"
 fi
-BUILD_NUMBER="$(git -C "$PROJECT_DIR" rev-list --count HEAD 2>/dev/null || echo 1)"
+VERSION="${VERSION#v}"
+[ -n "$VERSION" ] || die "no version: pass APP_VERSION, or set CFBundleShortVersionString in src/Info.plist"
+# CFBundleVersion mirrors the release version rather than counting commits.
+# Sparkle compares the appcast's <sparkle:version> against the *installed*
+# app's CFBundleVersion, so the two have to be derived the same way or the
+# updater silently decides you're already current. A commit count can't do
+# that job: it's identical for a dev build and a release cut from the same
+# commit, and it means nothing to a user reading About.
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP_DIR/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP_DIR/Contents/Info.plist"
-ok "Version $VERSION (build $BUILD_NUMBER)"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP_DIR/Contents/Info.plist"
+ok "Version $VERSION (CFBundleVersion $VERSION)"
 
-# Inject Sparkle EdDSA public key when provided by CI. Local dev builds
-# inherit whatever's already in Info.plist (typically empty during
-# bring-up; once you've run scripts/sparkle-keygen.sh and pasted the
-# pub key into Info.plist it'll be set there too). Sparkle aborts if
-# the key isn't a valid base64 string, so an empty value here means
-# "skip the updater" — AppDelegate handles that gracefully.
+# Inject the Sparkle EdDSA public key when CI provides it. Otherwise keep
+# whatever src/Info.plist carries, which is the same committed key — the two
+# must agree or a signed update is rejected on arrival, and the release
+# workflow fails the build if they don't. Sparkle aborts on a key that isn't
+# valid base64, so a blank value means "skip the updater" rather than "ship a
+# broken one"; AppDelegate handles that case.
 if [ -n "${SPARKLE_ED_PUBLIC_KEY:-}" ]; then
     /usr/libexec/PlistBuddy -c "Set :SUPublicEDKey ${SPARKLE_ED_PUBLIC_KEY}" "$APP_DIR/Contents/Info.plist" \
         || /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string ${SPARKLE_ED_PUBLIC_KEY}" "$APP_DIR/Contents/Info.plist"

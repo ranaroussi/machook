@@ -16,10 +16,14 @@
     <string>Machook</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <!-- The development baseline. Release builds overwrite both keys with the
+         tag version (see create-app-bundle.sh), so this value is what an
+         unreleased local build reports — deliberately lower than any tag so a
+         dev build is always offered the newest release. -->
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.0.1</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>0.0.1</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>
@@ -38,10 +42,14 @@
     <false/>
     <key>SUEnableAutomaticChecks</key>
     <true/>
-    <!-- Empty on purpose: Sparkle aborts on an invalid key, and AppDelegate
-         skips the updater entirely while this is blank. CI injects the real
-         key from the SPARKLE_ED_PUBLIC_KEY secret at bundle time. -->
+    <!-- The public half of the release signing keypair. Not a secret: it only
+         verifies signatures, and every shipped copy of the app contains it.
+         Keeping it here rather than injecting it from CI means a local build
+         validates updates exactly the way a released build does. CI still
+         overrides it from SPARKLE_ED_PUBLIC_KEY, which must match this value.
+         Private half: keychain service https://sparkle-project.org, account
+         "machook" (see scripts/sparkle-keygen.sh). -->
     <key>SUPublicEDKey</key>
-    <string></string>
+    <string>TVHOtDrpc5gmMTJ+7ZeQsphDqlURrHuyGKr4nb/rYrU=</string>
 </dict>
 </plist>

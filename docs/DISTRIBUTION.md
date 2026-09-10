@@ -58,9 +58,11 @@ The script writes `build/sparkle-keys/ed_public_key` and `build/sparkle-keys/ed_
 | `SPARKLE_ED_PUBLIC_KEY`  | Contents of `ed_public_key` (single base64 line) |
 | `SPARKLE_ED_PRIVATE_KEY` | Contents of `ed_private_key` (single base64 line) |
 
-Also paste the public key into `src/Info.plist` as the value of `<key>SUPublicEDKey</key>`, and commit. This bakes the verifier into local dev builds too so a buggy debug-build update path doesn't accidentally install unsigned artifacts.
+Also paste the public key into `src/Info.plist` as the value of `<key>SUPublicEDKey</key>`, and commit. The public key is not a secret — it only verifies signatures, and every shipped copy of the app contains it. Committing it means a local build validates updates exactly the way a released build does, so the update path can be tested before a release rather than after.
 
-`SUPublicEDKey` ships **empty** in this repo, which is a deliberate safe default: Sparkle aborts on a malformed key, so the app skips the updater entirely while the value is blank. A local build therefore has no update mechanism rather than a broken one, until you either do the paste above or let CI inject `SPARKLE_ED_PUBLIC_KEY` at bundle time.
+CI still injects `SPARKLE_ED_PUBLIC_KEY` at bundle time, and the `appcast` job fails the release if the key inside the built app doesn't match that secret. Those two disagreeing is otherwise invisible: the release publishes fine and every user's download is rejected at the final step.
+
+If you leave `SUPublicEDKey` empty, the app skips the updater entirely rather than shipping a broken one — Sparkle aborts on a malformed key. That's a safe state, not a working one.
 
 Once both keys are stored in GitHub secrets (and the public key is in `Info.plist`), **delete `build/sparkle-keys/`** — `.gitignore` already excludes it, but better to not have the private key sitting on disk.
 
@@ -87,7 +89,7 @@ That's it. The workflow at `.github/workflows/release.yml` then:
    `arm64` and `x86_64` and merged with `lipo`, as is the bundled `cloudflared`.
    A verification step fails the release if any shipped binary is missing a slice.
 2. Imports the Developer ID cert.
-3. Injects `SPARKLE_ED_PUBLIC_KEY` into `Info.plist` and `CFBundleShortVersionString` from the tag.
+3. Injects `SPARKLE_ED_PUBLIC_KEY` into `Info.plist`, and sets both `CFBundleShortVersionString` and `CFBundleVersion` from the tag.
 4. Code-signs the bundle (Sparkle XPC services, cloudflared, the main binary, the outer `.app`).
 5. Notarizes via `xcrun notarytool submit --wait`, then `xcrun stapler staple`.
 6. Packages `.zip` and `.dmg`, generates `.sha256` checksums.
@@ -95,6 +97,14 @@ That's it. The workflow at `.github/workflows/release.yml` then:
 8. (`appcast` job) Signs the release ZIP with the EdDSA private key via Sparkle's `sign_update`, prepends a fresh `<item>` block to `appcast.xml`, commits and pushes to `main`.
 
 Existing installs poll `appcast.xml` once a day (see `SUScheduledCheckInterval`) and on the next poll see the new version, prompt the user, download, verify the EdDSA signature, and install.
+
+### 2.1 Where version numbers come from
+
+The tag is the only place a release version is written. `create-app-bundle.sh` sets **both** `CFBundleShortVersionString` and `CFBundleVersion` to it, and the `appcast` job reads them back out of the ZIP it is about to sign.
+
+That symmetry is the whole point. Sparkle decides whether an update exists by comparing the appcast's `<sparkle:version>` against the installed app's `CFBundleVersion`. Derive those two from different places and they drift, at which point the updater tells every user they are current and no release ever reaches anybody. Reading them from the shipped artifact makes the appcast unable to describe anything other than what it signs, and a tag/bundle mismatch fails the release instead of shipping.
+
+Builds without a tag are development builds and take the baseline from `src/Info.plist` (`0.0.1`). Deliberately not `git describe`: that would make a local build claim to be the newest release, leaving the update path untestable on the machine you develop on.
 
 ### Cutting a pre-release
 
