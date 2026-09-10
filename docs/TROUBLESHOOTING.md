@@ -608,13 +608,14 @@ cloudflared tunnel --url http://127.0.0.1:7876
 ### `Couldn't resolve the hostname` / `curl: (6) Could not resolve host`
 
 The menu shows a `*.trycloudflare.com` URL, cloudflared logged
-`Registered tunnel connection`, and nothing on the internet can reach it.
-The URL was never in DNS.
+`Registered tunnel connection`, and the URL does not resolve.
 
-Quick tunnels are assigned a hostname before the record is published, and
-occasionally Cloudflare never publishes it. cloudflared has no idea: from
-its side the connection to the edge is up and healthy, which is why the app
-used to show the URL as if it worked.
+Quick tunnels are handed a hostname *before* the DNS record is published,
+and the gap can be minutes rather than seconds. cloudflared has no idea:
+from its side the connection to the edge is up and healthy, which is why
+the app used to show the URL as if it worked. Worse, every failed lookup
+during that gap gets cached locally as a negative answer, so this Mac can
+keep failing after the record appears.
 
 Machook now checks. Within about 90 seconds of a URL appearing it fetches
 `<url>/health` from the outside and reports what it found:
@@ -622,25 +623,55 @@ Machook now checks. Within about 90 seconds of a URL appearing it fetches
 ```bash
 curl -s http://127.0.0.1:7876/status | python3 -m json.tool | grep reach
 #   "tunnel_reachability": "unreachable",
-#   "tunnel_reachability_note": "hostname is not in DNS — Cloudflare never published it",
+#   "tunnel_reachability_note": "DNS: resolves publicly but not on this Mac — flush your DNS cache",
 ```
 
-The menu bar line and Settings show the same warning. Confirm it yourself:
+**Read that note carefully, because there are two different failures here**
+and Machook tells them apart by asking a public resolver whether the record
+exists at all:
+
+| Note | What happened | What to do |
+|---|---|---|
+| `DNS: not published yet by Cloudflare` | The record does not exist anywhere. | Wait, or `⌘T` for a different hostname. Machook keeps checking and will say so if it appears. |
+| `DNS: resolves publicly but not on this Mac` | The record exists; **your** resolver is the problem. Usually macOS cached the failure from before the record was published. | Flush the cache (below), or test from another device. |
+| `DNS: hostname does not resolve from this Mac` | The cross-check itself could not be reached, so neither of the above is proven. | Check your own connectivity first. |
+
+Flushing macOS's negative DNS cache needs admin rights:
 
 ```bash
-dig +short your-hostname.trycloudflare.com @1.1.1.1   # empty = NXDOMAIN
-dig +short trycloudflare.com @1.1.1.1                 # control: should answer
+sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder
 ```
 
-An empty answer for your hostname while the control resolves means the
-record was never published, and no amount of restarting the app changes
-that. What to do:
+You can confirm the split yourself — this is the fingerprint of a stale
+local cache, and it is easy to mistake for Cloudflare's fault:
 
-1. **Restart tunnel** (`⌘T`) to request a different hostname. It often works
-   on the next attempt.
-2. If it keeps happening, switch to a **named tunnel** on a hostname you
-   own: Settings → **Tunnel** → Mode → **Named (custom domain)**. The DNS
-   record is one you created, so it cannot silently fail to exist.
+```bash
+HOST=your-hostname.trycloudflare.com
+dig +short "$HOST" @1.1.1.1                 # has the record
+dscacheutil -q host -a name "$HOST"         # empty: this Mac disagrees
+curl -s --resolve "$HOST:443:$(dig +short "$HOST" @1.1.1.1 | head -1)" \
+  "https://$HOST/health"                    # {"ok":true} — the tunnel is fine
+```
+
+If the last command answers, nothing is wrong with the tunnel or with
+Machook. Only this Mac's resolver is behind.
+
+The menu bar line and Settings show the same note.
+
+**The verdict is not final.** Machook keeps probing for as long as the
+tunnel is up — every minute at first, then every five — so a record that
+shows up late flips the state to `reachable` on its own:
+
+```bash
+log show --predicate 'subsystem == "com.machook.app" && category == "tunnel"' \
+  --info --last 30m | grep -i reachab
+#   tunnel not reachable: https://… — DNS: not published yet by Cloudflare
+#   tunnel became reachable after all: https://…
+```
+
+If it never recovers, switch to a **named tunnel** on a hostname you own:
+Settings → **Tunnel** → Mode → **Named (custom domain)**. That DNS record
+is one you created, so it cannot silently fail to exist.
 
 Other verdicts you may see in that field:
 

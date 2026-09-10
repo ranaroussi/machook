@@ -16,7 +16,7 @@ cd src && swift test
 make test
 ```
 
-67 tests across 8 suites. They exercise the security boundary and the
+79 tests across 8 suites. They exercise the security boundary and the
 process runner directly rather than only through a live request, so a
 regression in quoting or timeout handling fails here before it ever
 reaches an HTTP surface.
@@ -29,7 +29,7 @@ reaches an HTTP surface.
 | `AppConfigTests` | `TemplateAndQuotingTests.swift` | Tool-name collision suffixing, enabled-vs-exists lookup, MCP catalog filtering, decoding a config that predates a new field without losing endpoints |
 | `RequestEnvelopeTests` | `TemplateAndQuotingTests.swift` | JSON body parsed into `body` and mirrored to `body_raw`, non-JSON body still delivered as text, binary body falling back to `body_base64`, written file is mode `0600` and not under `/tmp` |
 | `ListenerFallbackTests` | `ListenerFallbackTests.swift` | A real occupied loopback socket: the listener skips the taken port for the fallback and serves `/health` there; with no fallback left, the failure surfaces on `ServerStatus` naming the port and the conflict; a shutdown nobody requested raises a visible error while a requested one stays quiet |
-| `TunnelSupervisionTests` | `TunnelSupervisionTests.swift` | Reachability verdicts from probe outcomes (NXDOMAIN named as DNS, `530` as Cloudflare 1033, `502` as a local miss, offline, unexpected status); which cloudflared output gets promoted out of debug; stray-PID matching, including that another app's or Homebrew's tunnel is **never** a candidate, that a path prefix does not match, and that the supervised child is excluded; relative launch paths resolved to absolute |
+| `TunnelSupervisionTests` | `TunnelSupervisionTests.swift` | Reachability verdicts from probe outcomes (`530` as Cloudflare 1033, `502` as a local miss, offline, unexpected status); the DNS cross-check — a record found publicly blames this Mac and **not** Cloudflare, no record says "not published", an unanswerable check claims nothing, plus DoH parsing of A/CNAME/NXDOMAIN/SERVFAIL; which cloudflared output gets promoted out of debug; restart generations, so a superseded child cannot touch live state; stray-PID matching, including that another app's or Homebrew's tunnel is **never** a candidate, that a path prefix does not match, and that the supervised child is excluded; relative launch paths resolved to absolute |
 | `CommandRunnerTests` | `CommandRunnerTests.swift` | Real shells: stdout capture, non-zero exit with stderr, envelope readable byte-for-byte, **shell metacharacters in a payload do not execute**, `MACHOOK_REQUEST_FILE`, keep-request-files, stdin is `/dev/null` so `cat` doesn't hang, timeout kills the child, output cap without breaking completion, working directory, concurrency rejection, bad placeholder failing before spawn |
 
 `CommandRunnerTests` spawns real `zsh` processes (with `loginShell =
@@ -697,34 +697,57 @@ done
 # reachable
 ```
 
-Healthy path: `reachable`, and the menu bar shows the bare URL.
+Healthy path: `reachable`, and the menu bar shows the bare URL. The
+important follow-up, because this is what the probe order protects:
 
-Failure path (real, and the reason this exists) — the hostname never
-enters DNS:
+```bash
+HOST=$(curl -sS "${AUTH[@]}" "$BASE/status" | jq -r .tunnel_url | sed 's|https://||')
+dscacheutil -q host -a name "$HOST"     # must have ip_address entries
+curl -sS -m 15 "https://$HOST/health"   # {"ok":true} — plain curl, no tricks
+```
+
+If the second command fails with `(6) Could not resolve host` while the app
+says `reachable`, the probe queried the hostname too early and macOS cached
+the `NXDOMAIN`. That is a regression: each attempt must confirm the record
+in public DNS before touching the system resolver.
+
+Failure path — the record does not exist yet:
 
 ```
-# unreachable   hostname is not in DNS — Cloudflare never published it
+# unreachable   DNS: not published yet by Cloudflare
 ```
 
 Confirm the app is telling the truth rather than inventing a failure:
 
 ```bash
-HOST=$(curl -sS "${AUTH[@]}" "$BASE/status" | jq -r .tunnel_url | sed 's|https://||')
-dig +short "$HOST" @1.1.1.1          # empty = NXDOMAIN, app is right
-dig +short trycloudflare.com @1.1.1.1 # control: must answer
-curl -sS -m 8 "https://$HOST/health"  # curl: (6) Could not resolve host
+dig +short "$HOST" @1.1.1.1            # empty = genuinely not published
+dig +short cloudflare.com @1.1.1.1     # control: must answer
+```
+
+If `dig` answers but the app still says unreachable, the note must name
+*this Mac* rather than Cloudflare:
+
+```
+# unreachable   DNS: resolves publicly but not on this Mac — flush your DNS cache
+sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder
+# → within 60s the state flips to reachable on its own
+log show --predicate 'subsystem == "com.machook.app" && category == "tunnel"' \
+  --info --last 10m | grep -i "reachable after all"
 ```
 
 Also check the surfaces, since `/status` is not where a user looks:
 
 ```
-# Menu bar:  ⚠ https://… — hostname is not in DNS — Cloudflare never published it
+# Menu bar:  ⚠ https://… — DNS: not published yet by Cloudflare
 # Settings → Tunnel: an orange card saying the same, suggesting a named tunnel.
 ```
 
 Then `⌘T` (Restart tunnel) — a new hostname is requested and the probe
 starts over from `checking`. Turning the tunnel off returns the state to
-`unknown`.
+`unknown`. Restart it several times in a row and check `/status` still
+reports `tunnel_running: true` with a URL: a dying child's cleanup landing
+after its replacement started used to reset `isRunning`, which stranded the
+menu on `verifying…` for a tunnel that was working.
 
 ### 10b. Signals and leftover processes
 

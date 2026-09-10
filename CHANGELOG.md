@@ -36,13 +36,24 @@ to incoming webhooks.
   (ephemeral `trycloudflare.com` URL, no account) or named mode (stable
   hostname). The current URL is in the menu bar; click to copy.
 - **Verified tunnel URLs.** A published URL is not a working one: a quick tunnel
-  can be assigned a hostname Cloudflare never puts in DNS, and every other
-  signal still looks healthy. Machook now fetches `<url>/health` through the
-  public URL, retrying on a Fibonacci schedule for about 90 seconds, and
-  reports the outcome in the menu, in Settings, and as `tunnel_reachability`
-  on `GET /status`. Failures are named rather than generic: a missing DNS
-  record, an edge with no connector (Cloudflare error 1033), a tunnel that
-  reaches us but finds nothing listening, or an Access policy in the way.
+  is handed a hostname before its DNS record exists, and the gap can be
+  minutes while every other signal looks healthy. Machook fetches
+  `<url>/health` through the public URL — a Fibonacci warm-up over ~90
+  seconds, then every minute, then every five for as long as the tunnel is up
+  — and reports the outcome in the menu, in Settings, and as
+  `tunnel_reachability` on `GET /status`. A record that appears late flips the
+  state to reachable on its own instead of leaving a stale failure on screen.
+  Failures are named rather than generic: an edge with no connector
+  (Cloudflare error 1033), a tunnel that reaches us but finds nothing
+  listening, an Access policy in the way. A DNS failure is cross-checked
+  against a public resolver over DNS-over-HTTPS, so "Cloudflare has not
+  published the record" is distinguished from "the record exists and this Mac
+  cannot see it" — usually macOS caching the failures from before the record
+  appeared, which needs `sudo dscacheutil -flushcache` rather than a new
+  tunnel. That cross-check runs *before* each probe, not just after a failure:
+  asking the system resolver for a name that does not exist yet makes macOS
+  cache the `NXDOMAIN` for the whole negative TTL, which broke the user's own
+  `curl` to a tunnel that had come up fine.
 - **Tunnel process hygiene.** `SIGTERM` and `SIGINT` now quit the app through
   the normal path, so `pkill` no longer leaves a running menu bar app whose
   listener is dead. A `cloudflared` orphaned by a crash or a force-quit is
@@ -89,10 +100,12 @@ to incoming webhooks.
   shipped binary is missing a slice. The appcast's `minimumSystemVersion` is
   read from `LSMinimumSystemVersion` rather than hardcoded, so an update is
   never offered to a macOS version the app cannot run on.
-- 67 unit tests covering shell quoting, template rendering, path and tool-name
+- 79 unit tests covering shell quoting, template rendering, path and tool-name
   normalization, endpoint validation, configuration decoding, envelope shape and
   file permissions, port-candidate selection, the port fallback against a real
   occupied socket, reachability classification, cloudflared log levels, stray
   process matching (including that another app's tunnel is never a candidate),
-  listener shutdown reporting, and runner behaviour including timeouts, output
-  caps, concurrency, and that injected metacharacters do not execute.
+  DNS cross-check parsing and the verdicts derived from it, restart generation
+  bookkeeping, listener shutdown reporting, and runner behaviour including
+  timeouts, output caps, concurrency, and that injected metacharacters do not
+  execute.

@@ -93,7 +93,7 @@ cd machook
 make app        # build + bundle + sign  →  ./Machook.app
 make install    # same, then copy to /Applications
 make run        # build and launch
-make test       # 67 unit tests
+make test       # 79 unit tests
 ```
 
 Requirements: macOS 14+, Swift 6.0+ (Xcode command line tools are enough), and `cloudflared` if you want the bundler to pick up a local copy rather than downloading one.
@@ -337,7 +337,9 @@ Machook runs arbitrary commands on your Mac in response to network requests. Tha
 
 `cloudflared` ships inside the app bundle; Machook supervises it, parses the URL out of its output, restarts it if it dies, and shows the current URL in the menu bar (click to copy). Full walkthrough in [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md).
 
-The URL is verified before it is presented as working. Quick tunnels are occasionally handed a hostname Cloudflare never publishes in DNS — cloudflared reports a healthy connection while nothing on the internet can resolve you — so Machook fetches the public URL's `/health` from the outside and reports what it found. A URL that never answered is shown with the reason (`⚠ … — hostname is not in DNS`) rather than looking ready. If it keeps happening, switch to a named tunnel: that DNS record is one you own.
+The URL is verified before it is presented as working. A quick tunnel is handed its hostname *before* the DNS record exists, so cloudflared reports a healthy connection while nothing can resolve you yet. Machook waits for the record to appear in public DNS and then fetches the URL's `/health` from the outside, so "reachable" in the menu means a request actually completed. Checking in that order matters: asking your Mac for a hostname that does not exist yet makes macOS cache the failure, which would break your own `curl` to a tunnel that came up fine moments later.
+
+If a URL never answers, the menu says why instead of looking ready, and keeps rechecking in case a late DNS record rescues it. For anything you cannot afford to babysit, use a named tunnel: the hostname is stable and the DNS record is one you own.
 
 ## Configuration
 
@@ -388,7 +390,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7876/status
 ```bash
 cd src
 swift build            # debug
-swift test             # 67 tests: quoting, templating, envelope, runner, ports, tunnel
+swift test             # 79 tests: quoting, templating, envelope, runner, ports, tunnel
 swift build -c release
 
 cd .. && make app      # bundle + sign

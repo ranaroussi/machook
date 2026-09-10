@@ -24,6 +24,30 @@ public final class TunnelManager: @unchecked Sendable {
     /// In-flight reachability verification for the current URL.
     private var probeTask: Task<Void, Never>?
 
+    /// Incremented on every spawn, so work belonging to a child we have
+    /// already replaced can recognise itself as obsolete and do nothing.
+    ///
+    /// Restarting the tunnel kills one cloudflared and starts another
+    /// immediately, but the dying child's `terminationHandler` — and the
+    /// blocks it hands to other queues — can land *after* the replacement is
+    /// up. Unconditional cleanup then wipes the live tunnel's state:
+    /// `isRunning` back to false, the URL to nil, the reachability probe
+    /// cancelled, and the menu stuck on "verifying…" for a tunnel that is
+    /// working.
+    private let generationLock = NSLock()
+    private var spawnGeneration: UInt64 = 0
+
+    func nextGeneration() -> UInt64 {
+        generationLock.lock(); defer { generationLock.unlock() }
+        spawnGeneration += 1
+        return spawnGeneration
+    }
+
+    func isCurrent(_ generation: UInt64) -> Bool {
+        generationLock.lock(); defer { generationLock.unlock() }
+        return generation == spawnGeneration
+    }
+
     /// Verification state, kept here rather than only on the `@MainActor`
     /// `TunnelStatus` so `GET /status` can read it without hopping actors —
     /// the same split already used for `publicURL`.
@@ -160,6 +184,8 @@ public final class TunnelManager: @unchecked Sendable {
             }
         }
 
+        let generation = nextGeneration()
+
         let consume: @Sendable (FileHandle) -> Void = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
@@ -179,7 +205,7 @@ public final class TunnelManager: @unchecked Sendable {
             }
 
             guard let url = runtime.urlExtractor(text) else { return }
-            guard let self else { return }
+            guard let self, self.isCurrent(generation) else { return }
             self.urlLock.lock()
             let firstTime = self.publicURL != url
             self.publicURL = url
@@ -190,6 +216,7 @@ public final class TunnelManager: @unchecked Sendable {
             // Mirror to the SwiftUI-observable singleton so the Settings
             // window can show "Connecting…" → live URL without polling.
             Task { @MainActor in
+                guard self.isCurrent(generation) else { return }
                 TunnelStatus.shared.publicURL = url
                 TunnelStatus.shared.isRunning = true
             }
@@ -205,15 +232,27 @@ public final class TunnelManager: @unchecked Sendable {
             let status = proc.terminationStatus
             let reason = proc.terminationReason
             Log.tunnel.notice("cloudflared exited (status=\(status), reason=\(reason.rawValue))")
+            // Always ours to release: these handlers belong to this child's
+            // pipes and nothing else reads them.
             stdout.fileHandleForReading.readabilityHandler = nil
             stderr.fileHandleForReading.readabilityHandler = nil
-            self?.probeTask?.cancel()
-            self?.setReachability(.unknown)
-            DispatchQueue.main.async {
-                self?.isRunning = false
-                self?.publicURL = nil
+
+            guard let self else { return }
+            guard self.isCurrent(generation) else {
+                Log.tunnel.debug("ignoring exit of superseded cloudflared PID \(proc.processIdentifier)")
+                return
             }
+
+            self.probeTask?.cancel()
+            self.setReachability(.unknown)
+            self.urlLock.lock()
+            self.publicURL = nil
+            self.urlLock.unlock()
+            self.isRunning = false
             Task { @MainActor in
+                // Re-check: this hop can land after a replacement is already
+                // publishing its own URL.
+                guard self.isCurrent(generation) else { return }
                 TunnelStatus.shared.publicURL = nil
                 TunnelStatus.shared.isRunning = false
             }
@@ -269,7 +308,11 @@ public final class TunnelManager: @unchecked Sendable {
         isRunning = false
         publicURL = nil
         setReachability(.unknown)
+        // Retire this generation: anything still queued on behalf of the child
+        // we just killed is now obsolete and must not touch the next one.
+        let stopped = nextGeneration()
         Task { @MainActor in
+            guard self.isCurrent(stopped) else { return }
             TunnelStatus.shared.publicURL = nil
             TunnelStatus.shared.isRunning = false
         }
@@ -349,36 +392,200 @@ public final class TunnelManager: @unchecked Sendable {
 
         setReachability(.checking)
 
+        let host = URL(string: base)?.host
+
         probeTask = Task.detached { [weak self] in
             // A single failure means nothing: DNS for a fresh quick tunnel can
             // take a few seconds to publish, and a named tunnel's connector
             // needs time to register. Fibonacci backoff spans ~87s in 8
             // attempts, which is long enough to outlast a slow start without
             // leaving the menu ambiguous for minutes.
-            let delays: [UInt64] = [1, 2, 3, 5, 8, 13, 21, 34]
-            var outcome: TunnelStatus.Reachability = .checking
+            let warmup: [UInt64] = [1, 2, 3, 5, 8, 13, 21, 34]
+            var reported = false
 
-            for (attempt, delay) in delays.enumerated() {
+            for (attempt, delay) in warmup.enumerated() {
                 if Task.isCancelled { return }
                 try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
                 if Task.isCancelled { return }
                 // Stopped, or restarted onto a different URL, while we waited.
-                guard let self, self.isRunning, self.publicURL == url else { return }
+                // Leaving the state at `.checking` here is what put a permanent
+                // "verifying…" in the menu, so hand it back to `.unknown`
+                // unless a newer probe has taken over.
+                guard let self, self.isRunning, self.publicURL == url else {
+                    self?.resignChecking(for: url)
+                    return
+                }
 
-                outcome = await Self.probeOnce(target)
-                if outcome == .reachable {
+                // Do not ask the system resolver for a name that probably
+                // does not exist yet. macOS caches the NXDOMAIN, and that
+                // cached negative answer outlives the condition — the record
+                // gets published, and this Mac keeps failing to resolve it
+                // for the whole negative TTL. The user's own `curl` inherits
+                // the same poisoned cache, so an over-eager probe turns a
+                // slow start into a broken tunnel.
+                if let host, await Self.resolvesPublicly(host) == false {
+                    Log.tunnel.debug("probe \(attempt + 1)/\(warmup.count): \(host, privacy: .public) not in public DNS yet, not asking the system resolver")
+                    continue
+                }
+
+                switch await Self.probeOnce(target) {
+                case .reachable:
                     Log.tunnel.info("tunnel verified reachable: \(url, privacy: .public)")
                     self.setReachability(.reachable)
                     return
+                case .unreachable(let why):
+                    Log.tunnel.debug("probe \(attempt + 1)/\(warmup.count) failed for \(url, privacy: .public): \(why, privacy: .public)")
+                case .unknown, .checking:
+                    break
                 }
-                Log.tunnel.debug("probe \(attempt + 1)/\(delays.count) failed for \(url, privacy: .public)")
             }
 
-            if Task.isCancelled { return }
-            if case .unreachable(let why) = outcome {
-                Log.tunnel.error("tunnel never became reachable: \(url, privacy: .public) — \(why, privacy: .public)")
+            // The warm-up window closing is not proof of a dead tunnel — a
+            // quick-tunnel DNS record has been observed appearing minutes
+            // after the hostname was handed out. Reporting a failure and then
+            // never looking again leaves the menu permanently wrong about a
+            // tunnel that started working, so keep checking for as long as
+            // the tunnel is up.
+            //
+            // A minute apart while the failure is fresh, then every five, so
+            // an app left running for days is not making a request a minute
+            // forever.
+            var consecutive = 0
+            while true {
+                if Task.isCancelled { return }
+                guard let self, self.isRunning, self.publicURL == url else {
+                    self?.resignChecking(for: url)
+                    return
+                }
+
+                // Same reasoning as the warm-up: while the record is provably
+                // absent, say so without making the system resolver cache
+                // another negative answer.
+                let outcome: TunnelStatus.Reachability
+                if let host, await Self.resolvesPublicly(host) == false {
+                    outcome = Self.dnsVerdict(publiclyResolves: false)
+                } else {
+                    outcome = await Self.refine(await Self.probeOnce(target), host: host)
+                }
+                if Task.isCancelled { return }
+
+                switch outcome {
+                case .reachable:
+                    if reported {
+                        Log.tunnel.notice("tunnel became reachable after all: \(url, privacy: .public)")
+                    } else {
+                        Log.tunnel.info("tunnel verified reachable: \(url, privacy: .public)")
+                    }
+                    self.setReachability(.reachable)
+                    return
+                case .unreachable(let why):
+                    if !reported {
+                        Log.tunnel.error("tunnel not reachable: \(url, privacy: .public) — \(why, privacy: .public)")
+                        reported = true
+                    }
+                    self.setReachability(outcome)
+                case .unknown, .checking:
+                    break
+                }
+
+                consecutive += 1
+                let interval: UInt64 = consecutive <= 10 ? 60 : 300
+                // Debug rather than notice: the first failure was already
+                // reported loudly, and this repeats every minute. It is here
+                // so "is it still watching?" is an answerable question.
+                Log.tunnel.debug("recheck \(consecutive) for \(url, privacy: .public); next in \(interval)s")
+                try? await Task.sleep(nanoseconds: interval * 1_000_000_000)
             }
-            self?.setReachability(outcome)
+        }
+    }
+
+    /// Drop out of `.checking` when a probe abandons the URL it was verifying.
+    ///
+    /// "Verifying…" is a promise that an answer is coming. If the probe gives
+    /// up — the tunnel stopped, or a restart moved us to a different URL —
+    /// something has to clear it, or the menu keeps promising forever.
+    private func resignChecking(for url: String) {
+        // A newer probe owns the state now; leave its `.checking` alone.
+        guard publicURL == url || publicURL == nil else { return }
+        if reachability == .checking { setReachability(.unknown) }
+    }
+
+    /// Sharpen a DNS failure by asking a public resolver whether the record
+    /// exists at all.
+    ///
+    /// The two causes need opposite responses from the user and the local
+    /// failure looks identical either way: Cloudflare has not published the
+    /// record yet (wait, or restart the tunnel), or the record exists and
+    /// *this Mac* cannot see it (a stale negative entry in `mDNSResponder`
+    /// after the earlier failures, or a filtering resolver). Guessing between
+    /// them is how the menu ends up blaming the wrong party.
+    static func refine(
+        _ outcome: TunnelStatus.Reachability,
+        host: String?
+    ) async -> TunnelStatus.Reachability {
+        guard case .unreachable(let why) = outcome, why.contains("DNS"), let host else {
+            return outcome
+        }
+        return dnsVerdict(publiclyResolves: await resolvesPublicly(host))
+    }
+
+    static func dnsVerdict(publiclyResolves: Bool?) -> TunnelStatus.Reachability {
+        switch publiclyResolves {
+        case true:
+            return .unreachable("DNS: resolves publicly but not on this Mac — flush your DNS cache")
+        case false:
+            return .unreachable("DNS: not published yet by Cloudflare")
+        case nil:
+            return .unreachable("DNS: hostname does not resolve from this Mac")
+        }
+    }
+
+    /// `true` if a public resolver has an address record for `host`, `false`
+    /// if it authoritatively does not, `nil` if the question could not be
+    /// asked — which must not be reported as either answer.
+    ///
+    /// Uses DNS-over-HTTPS so the lookup bypasses the system resolver whose
+    /// answer we are trying to second-guess. The hostname is one Cloudflare
+    /// issued or hosts for the user, so it is not disclosed to anyone new.
+    private static func resolvesPublicly(_ host: String) async -> Bool? {
+        var components = URLComponents(string: "https://cloudflare-dns.com/dns-query")
+        components?.queryItems = [
+            URLQueryItem(name: "name", value: host),
+            URLQueryItem(name: "type", value: "A")
+        ]
+        guard let url = components?.url else { return nil }
+
+        var request = URLRequest(url: url)
+        request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 5
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            return parseDoHAnswer(data)
+        } catch {
+            return nil
+        }
+    }
+
+    /// `true` when the response carries at least one address record, `false`
+    /// for an authoritative absence (`NXDOMAIN`, or success with no answer),
+    /// `nil` when the payload cannot be read.
+    static func parseDoHAnswer(_ data: Data) -> Bool? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let status = json["Status"] as? Int else { return nil }
+        // 0 = NOERROR, 3 = NXDOMAIN. Anything else (SERVFAIL, REFUSED) is the
+        // resolver failing to answer, not evidence about the record.
+        switch status {
+        case 0:
+            let answers = json["Answer"] as? [[String: Any]] ?? []
+            // Type 1 = A, 5 = CNAME. A CNAME chain still means the name exists.
+            return answers.contains { ($0["type"] as? Int).map { $0 == 1 || $0 == 5 } ?? false }
+        case 3:
+            return false
+        default:
+            return nil
         }
     }
 
@@ -429,7 +636,12 @@ public final class TunnelManager: @unchecked Sendable {
             // The failure this exists for. Quick tunnels get a hostname
             // assigned before — and sometimes without ever — a DNS record
             // being published, so name the cause and the way out.
-            return .unreachable("hostname is not in DNS — Cloudflare never published it")
+            // Deliberately non-committal: `refine` decides whether the record
+            // is missing everywhere or just here. Asserting Cloudflare never
+            // published it is a guess, and it was wrong the first time we
+            // shipped it — the record showed up minutes later while this Mac
+            // kept serving a cached negative answer.
+            return .unreachable("DNS: hostname does not resolve from this Mac")
         case NSURLErrorTimedOut:
             return .unreachable("timed out")
         case NSURLErrorCannotConnectToHost, NSURLErrorNetworkConnectionLost:

@@ -718,16 +718,39 @@ So the URL is verified from the outside rather than trusted:
 - `beginReachabilityProbe(url:)` fetches `<url>/health` — chosen because it
   is the one route that needs no token, so a probe cannot be confused with
   an auth failure.
-- Retries follow Fibonacci delays `[1, 2, 3, 5, 8, 13, 21, 34]` seconds,
-  roughly 90 s in total. A quick tunnel's DNS record normally lands within
-  a few seconds; the long tail is there so a slow propagation is not
-  reported as a failure.
+- A warm-up burst uses Fibonacci delays `[1, 2, 3, 5, 8, 13, 21, 34]`
+  seconds, roughly 90 s, and reports nothing until it ends: a quick tunnel's
+  record normally lands within seconds, and flashing a failure at t=1s would
+  be noise.
+- **The warm-up ending is not a verdict for the rest of the process's life.**
+  A record has been observed appearing minutes after the hostname was handed
+  out, and the first version of this feature reported `unreachable` and never
+  looked again — leaving the menu permanently wrong about a tunnel that had
+  started working. The probe keeps going while the tunnel is up: every 60 s
+  for ten attempts, then every 5 minutes, and logs
+  `tunnel became reachable after all` when a late record rescues it.
 - `classifyProbe(statusCode:error:)` turns the outcome into a cause the
-  user can act on: `NXDOMAIN` means the record was never published, `530`
-  means the edge has no connector (Cloudflare error 1033), `502/503/504`
-  means the tunnel works and our own listener does not, `403` means
-  Cloudflare Access is in front. It is a pure function, which is what
-  makes those mappings testable.
+  user can act on: `530` means the edge has no connector (Cloudflare error
+  1033), `502/503/504` means the tunnel works and our own listener does not,
+  `403` means Cloudflare Access is in front. It is a pure function, which is
+  what makes those mappings testable.
+- **The public resolver is asked first, and it is not only for diagnosis.**
+  An eager probe is actively harmful: querying a hostname before its record
+  exists makes macOS cache the `NXDOMAIN`, and that negative answer outlives
+  the condition — the record gets published and this Mac still cannot resolve
+  it, for the whole negative TTL. The user's own `curl` inherits the same
+  poisoned cache, so a slow start becomes a broken tunnel *because we
+  checked*. Each attempt therefore asks a public resolver first and only
+  touches the system resolver once the record provably exists.
+- A DNS failure gets a second question, because on its own it cannot tell
+  the two causes apart and they need opposite responses. `refine` asks a
+  public resolver over DNS-over-HTTPS — deliberately bypassing the system
+  resolver whose answer is in doubt — and `dnsVerdict` maps the result:
+  the record exists publicly (so *this Mac* is the problem: a stale negative
+  entry in `mDNSResponder`, or a filtering resolver), the record does not
+  exist yet, or the cross-check itself failed and nothing is claimed. The
+  first message the app ever shipped asserted "Cloudflare never published
+  it", which was wrong within four minutes of being written.
 - The verdict lands in `TunnelStatus.Reachability` (`unknown`, `checking`,
   `reachable`, `unreachable(String)`) and is surfaced in the menu line, as
   a Settings card, and as `tunnel_reachability` on `/status`. The state
@@ -735,7 +758,27 @@ So the URL is verified from the outside rather than trusted:
   without an actor hop, the same split already used for `publicURL`.
 - The probe is cancelled when the tunnel stops, when the child exits, and
   when a new URL supersedes the one being checked, so a restart never
-  reports a verdict about a URL that no longer exists.
+  reports a verdict about a URL that no longer exists. If it abandons a URL
+  it was verifying, it clears `.checking` rather than leaving "verifying…"
+  as a promise nothing will keep.
+
+### One tunnel at a time, even during a restart
+
+Restarting kills one `cloudflared` and starts another immediately, and the
+dying child's `terminationHandler` — plus the queue hops it makes — can land
+*after* the replacement is already up. The first version cleaned up
+unconditionally, so the dead child's handler set `isRunning = false` on a
+live tunnel. The probe loop checks `isRunning` before every attempt, saw
+false, abandoned a working tunnel, and left `verifying…` in the menu
+forever. `/status` showed the contradiction plainly: a URL, a live child
+process, `tunnel_running: false`.
+
+Every spawn now takes a generation number from `nextGeneration()`, and every
+piece of deferred work re-checks `isCurrent(_:)` before touching shared
+state — including inside the `@MainActor` hops, since passing the check at
+handler entry says nothing about where things stand a hop later. `stop()`
+retires its generation on the way out, so a killed child's callbacks are
+inert by construction rather than by timing.
 
 ### Cleaning up after ourselves
 

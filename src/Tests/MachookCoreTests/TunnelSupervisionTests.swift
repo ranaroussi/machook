@@ -76,6 +76,83 @@ final class TunnelSupervisionTests: XCTestCase {
         XCTAssertTrue(why.contains("418"))
     }
 
+    // MARK: - Telling the two DNS failures apart
+
+    /// These two need opposite actions from the user and look identical from
+    /// here: the record does not exist yet (wait, or restart the tunnel), or
+    /// it exists and this Mac cannot see it — a stale negative entry in
+    /// `mDNSResponder` after the early failures, or a filtering resolver.
+    func testARecordFoundPubliclyBlamesTheLocalResolver() {
+        guard case .unreachable(let why) = TunnelManager.dnsVerdict(publiclyResolves: true) else {
+            return XCTFail("expected unreachable")
+        }
+        XCTAssertTrue(why.contains("this Mac"), why)
+        XCTAssertFalse(why.lowercased().contains("cloudflare"), "must not blame Cloudflare: \(why)")
+    }
+
+    func testNoRecordAnywhereSaysItIsNotPublishedYet() {
+        guard case .unreachable(let why) = TunnelManager.dnsVerdict(publiclyResolves: false) else {
+            return XCTFail("expected unreachable")
+        }
+        XCTAssertTrue(why.contains("not published"), why)
+    }
+
+    /// Not being able to ask is not evidence either way, so the message must
+    /// describe the symptom without naming a culprit.
+    func testUnansweredCrossCheckClaimsNothing() {
+        guard case .unreachable(let why) = TunnelManager.dnsVerdict(publiclyResolves: nil) else {
+            return XCTFail("expected unreachable")
+        }
+        XCTAssertTrue(why.contains("does not resolve"), why)
+        XCTAssertFalse(why.contains("not published"), "no verdict was available: \(why)")
+    }
+
+    func testDoHAnswerWithAnAddressRecordCountsAsResolving() {
+        let json = #"{"Status":0,"Answer":[{"name":"x.trycloudflare.com","type":1,"TTL":300,"data":"104.16.231.132"}]}"#
+        XCTAssertEqual(TunnelManager.parseDoHAnswer(Data(json.utf8)), true)
+    }
+
+    func testDoHCNAMEChainCountsAsResolving() {
+        let json = #"{"Status":0,"Answer":[{"name":"hooks.example.com","type":5,"data":"tunnel.cfargotunnel.com."}]}"#
+        XCTAssertEqual(TunnelManager.parseDoHAnswer(Data(json.utf8)), true)
+    }
+
+    func testDoHNXDOMAINIsAnAuthoritativeNo() {
+        XCTAssertEqual(TunnelManager.parseDoHAnswer(Data(#"{"Status":3}"#.utf8)), false)
+    }
+
+    /// NOERROR with no address record is still "the name has nothing to
+    /// connect to", which is a no.
+    func testDoHNoErrorWithoutAnAddressIsANo() {
+        let json = #"{"Status":0,"Answer":[{"name":"x.com","type":16,"data":"some txt"}]}"#
+        XCTAssertEqual(TunnelManager.parseDoHAnswer(Data(json.utf8)), false)
+    }
+
+    /// SERVFAIL and friends are the resolver failing, not evidence about the
+    /// record — reporting them as either answer would be a guess.
+    func testDoHServerFailureYieldsNoVerdict() {
+        XCTAssertNil(TunnelManager.parseDoHAnswer(Data(#"{"Status":2}"#.utf8)))
+        XCTAssertNil(TunnelManager.parseDoHAnswer(Data("not json".utf8)))
+        XCTAssertNil(TunnelManager.parseDoHAnswer(Data(#"{"Answer":[]}"#.utf8)))
+    }
+
+    /// Only a DNS-flavoured failure gets the cross-check; a 530 or a timeout
+    /// already knows what it is and must pass through untouched.
+    func testRefineLeavesNonDNSFailuresAlone() async {
+        let edge = TunnelStatus.Reachability.unreachable("Cloudflare has no connector for this hostname (1033)")
+        let refined = await TunnelManager.refine(edge, host: "example.trycloudflare.com")
+        XCTAssertEqual(refined, edge)
+
+        let reachable = await TunnelManager.refine(.reachable, host: "example.trycloudflare.com")
+        XCTAssertEqual(reachable, .reachable)
+    }
+
+    func testRefineWithoutAHostCannotCrossCheck() async {
+        let dns = TunnelStatus.Reachability.unreachable("DNS: hostname does not resolve from this Mac")
+        let refined = await TunnelManager.refine(dns, host: nil)
+        XCTAssertEqual(refined, dns)
+    }
+
     // MARK: - Reachability presentation
 
     func testMenuNoteIsSilentWhenThereIsNothingToSay() {
@@ -123,6 +200,30 @@ final class TunnelSupervisionTests: XCTestCase {
             TunnelManager.logLevel(forCloudflaredLine: "INF Unregistered tunnel connection connIndex=1"),
             .notice
         )
+    }
+
+    // MARK: - Restart bookkeeping
+
+    /// The live bug this guards against: Restart tunnel killed one cloudflared
+    /// and started another, the dead child's termination handler landed after
+    /// the replacement was up, and its unconditional cleanup set `isRunning`
+    /// back to false. The probe loop checks `isRunning` before each attempt,
+    /// so it silently abandoned a working tunnel and left "verifying…" in the
+    /// menu forever.
+    func testOnlyTheNewestSpawnCanTouchSharedState() {
+        let manager = TunnelManager()
+        let first = manager.nextGeneration()
+        XCTAssertTrue(manager.isCurrent(first))
+
+        let second = manager.nextGeneration()
+        XCTAssertFalse(manager.isCurrent(first), "a superseded child must not be able to act")
+        XCTAssertTrue(manager.isCurrent(second))
+    }
+
+    func testGenerationsNeverRepeat() {
+        let manager = TunnelManager()
+        let seen = (0..<50).map { _ in manager.nextGeneration() }
+        XCTAssertEqual(Set(seen).count, seen.count)
     }
 
     // MARK: - Stray process reaping
