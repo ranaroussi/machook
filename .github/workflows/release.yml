@@ -12,9 +12,9 @@ permissions:
 jobs:
   build:
     name: Build (universal)
-    # macos-15 ships Xcode 16.4 (Swift 6.1) by default. macos-14 only has up
-    # to Xcode 16.2 (Swift 6.0) and is being deprecated in late 2026 anyway,
-    # so we may as well jump now.
+    # macos-15 defaults to Xcode 16.4 (Swift 6.1) but carries 26.x alongside
+    # it, which the next step selects. macos-14 tops out at Xcode 16.2 and is
+    # deprecated in late 2026 anyway.
     #
     # One job, not an arch matrix: create-app-bundle.sh cross-compiles both
     # slices and lipos them into a single universal bundle. Sparkle's appcast
@@ -28,27 +28,32 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Select Xcode 16.x (Swift 6 toolchain)
-        # Package.swift declares swift-tools-version: 6.0 — needs Xcode
-        # 16.x. The macos-14 runner image's default is Xcode 15.4
-        # (Swift 5.10), which trips `error: package is using Swift
-        # tools version 6.0.0 but the installed version is 5.10.0`.
+      - name: Select Xcode 26.x (must match the toolchain releases are developed on)
+        # Not the runner default (16.4 / Swift 6.1) and not "whatever is
+        # newest". Both are wrong for a release path:
         #
-        # Pick the highest Xcode_16* present so we ride the runner
-        # image's upgrades automatically (today 16.2; tomorrow 16.3+).
-        # macOS 14 runners are deprecating in late 2026 — at some
-        # point we'll want to switch runs-on to macos-15, which ships
-        # 16.x natively.
+        # A toolchain *older* than the maintainer's rejects code that compiles
+        # fine locally, and the failure surfaces only after a tag is pushed. A
+        # switch over an Optional<Bool> using true/false/nil literals is
+        # exhaustive from Swift 6.2 but not 6.1, and that is exactly how the
+        # first v0.1.0 tag died.
+        #
+        # "Newest available" is no better: the images carry Xcode previews, and
+        # a release should never be the first thing to try one.
+        #
+        # So pin the major and let patch releases through. Bump this when the
+        # local Xcode moves — the runner image tracks the same builds (26.3
+        # 17C529 as of this writing).
         run: |
           xcode_path=""
-          for candidate in $(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -rV); do
+          for candidate in $(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -rV); do
             if [ -d "$candidate" ]; then
               xcode_path="$candidate"
               break
             fi
           done
           if [ -z "$xcode_path" ]; then
-            echo "::error::No Xcode 16.x found on the runner. Available Xcodes:"
+            echo "::error::No Xcode 26.x found on the runner. Available Xcodes:"
             ls -d /Applications/Xcode*.app 2>/dev/null || echo "(none)"
             exit 1
           fi
@@ -327,6 +332,27 @@ jobs:
           echo "version=$SHORT_VERSION"      >> "$GITHUB_OUTPUT"
           echo "build_number=$BUILD_NUMBER"  >> "$GITHUB_OUTPUT"
           echo "zip=$ZIP"                    >> "$GITHUB_OUTPUT"
+
+      - name: Select Xcode 26.x (same toolchain as the build job)
+        # This job compiles the package too, so it needs the same compiler as
+        # the build job. On the runner default it would fail on code the build
+        # job accepted — after the release is already published, leaving a
+        # release with no appcast entry and therefore no way to auto-update to.
+        run: |
+          xcode_path=""
+          for candidate in $(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -rV); do
+            if [ -d "$candidate" ]; then
+              xcode_path="$candidate"
+              break
+            fi
+          done
+          if [ -z "$xcode_path" ]; then
+            echo "::error::No Xcode 26.x found on the runner. Available Xcodes:"
+            ls -d /Applications/Xcode*.app 2>/dev/null || echo "(none)"
+            exit 1
+          fi
+          sudo xcode-select -s "$xcode_path"
+          echo "Selected: $xcode_path"
 
       - name: Build Sparkle helpers (need sign_update binary)
         run: |

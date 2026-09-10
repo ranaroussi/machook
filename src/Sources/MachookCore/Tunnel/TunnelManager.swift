@@ -530,12 +530,15 @@ public final class TunnelManager: @unchecked Sendable {
     }
 
     static func dnsVerdict(publiclyResolves: Bool?) -> TunnelStatus.Reachability {
+        // Spelled `.some`/`.none` rather than `true`/`false`/`nil`: matching an
+        // Optional<Bool> against plain boolean literals only counts as
+        // exhaustive from Swift 6.2 on, and CI builds with 6.1.
         switch publiclyResolves {
-        case true:
+        case .some(true):
             return .unreachable("DNS: resolves publicly but not on this Mac — flush your DNS cache")
-        case false:
+        case .some(false):
             return .unreachable("DNS: not published yet by Cloudflare")
-        case nil:
+        case .none:
             return .unreachable("DNS: hostname does not resolve from this Mac")
         }
     }

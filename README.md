@@ -40,8 +40,6 @@ POST https://your-tunnel.example.com/deploy
 - [Configuration](#configuration)
 - [Built-in API](#built-in-api)
 - [Development](#development)
-- [Releasing](#releasing)
-- [Project layout](#project-layout)
 - [License](#license)
 
 ## Why
@@ -397,43 +395,7 @@ cd .. && make app      # bundle + sign
 log stream --predicate 'subsystem == "com.machook.app"'   # live logs
 ```
 
-The package splits into a thin `Machook` executable and a `MachookCore` library so the logic is testable. See [TESTING.md](./TESTING.md) for the manual matrix and [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for how the pieces fit.
-
-## Releasing
-
-Tag and push; CI builds both architectures, signs, notarizes, publishes the release, and updates `appcast.xml` for Sparkle.
-
-```bash
-git tag v0.2.0 && git push origin v0.2.0
-```
-
-Maintainer setup (Developer ID, notarization credentials, Sparkle keypair) is in [docs/DISTRIBUTION.md](./docs/DISTRIBUTION.md).
-
-## Project layout
-
-```
-src/
-  Package.swift                    Machook (executable) + MachookCore (library) + tests
-  Info.plist
-  Sources/Machook/                 main.swift, bundled Resources (icons, cloudflared)
-  Sources/MachookCore/
-    AppDelegate.swift              menu bar, boot sequence, config observation
-    AppConfig.swift                config model + UserDefaults store
-    API/LocalAPIServer.swift       routes, dispatch, response mapping, auth
-    API/ServerStatus.swift         observable listener state, bind failures
-    Endpoints/EndpointRule.swift   one endpoint: path, command, MCP surface
-    Endpoints/ShellQuote.swift     the injection boundary
-    Endpoints/CommandTemplate.swift  {{request}} substitution
-    Endpoints/RequestEnvelope.swift  the JSON handed to your command
-    Endpoints/CommandRunner.swift  process execution, timeouts, caps, concurrency
-    Endpoints/ExecutionLog.swift   recent runs, shown in the menu
-    MCP/MCPService.swift           tool catalog + tools/call
-    Settings/                      SwiftUI settings + endpoint editor
-    Tunnel/                        cloudflared supervision
-  Tests/MachookCoreTests/
-create-app-bundle.sh               bundle, sign, verify self-containment
-Makefile · docs/ · scripts/
-```
+The package splits into a thin `Machook` executable and a `MachookCore` library so the logic is testable. See [TESTING.md](./TESTING.md) for the manual matrix, [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for how the pieces fit, and [docs/DISTRIBUTION.md](./docs/DISTRIBUTION.md) for signing, notarization, and cutting a release.
 
 ## License
 
