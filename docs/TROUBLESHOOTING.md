@@ -133,6 +133,59 @@ Blank is fine (no auto-updates in dev builds). A malformed non-blank value
 is the bug — clear it, or set a real key from
 `scripts/sparkle-keygen.sh`.
 
+### The app is running, the icon is there, and the port is dead
+
+The menu bar shows a warning line, and Settings repeats it:
+
+```
+The HTTP listener on port 7876 stopped on its own. Quit and reopen Machook
+to start serving again.
+```
+
+Something stopped the listener out from under the app. The usual cause is a
+signal Machook did not handle — an older build treated `pkill Machook` as a
+`SIGTERM` its HTTP service absorbed, shutting down the listener while the
+menu bar app carried on looking healthy. Current builds route `SIGTERM` and
+`SIGINT` to a normal quit, so the whole app exits:
+
+```bash
+log show --predicate 'subsystem == "com.machook.app" && category == "app"' \
+  --info --last 5m | grep signal
+#   received signal 15 — terminating cleanly
+```
+
+If you see the warning anyway, quit and reopen. If the app will not quit,
+`kill -9` it and reopen — the next launch also cleans up any `cloudflared`
+left behind (below).
+
+### A `cloudflared` from an earlier run is still going
+
+`kill -9` on the app leaves its tunnel child reparented to launchd, holding
+a tunnel that points at the port your next launch will serve. Machook sweeps
+these at startup:
+
+```bash
+log show --predicate 'subsystem == "com.machook.app" && category == "tunnel"' \
+  --info --last 2m | grep -i stray
+#   reaping stray cloudflared PID 54039 from a previous run
+```
+
+The sweep only matches the exact `cloudflared` path inside the running
+`Machook.app` bundle, so your own Homebrew tunnels and other apps' tunnels
+are never candidates. The flip side: a **dev build** that falls back to
+`/opt/homebrew/bin/cloudflared` shares that path with everything else on the
+machine, so nothing is swept and the log says so:
+
+```
+skipping stray sweep: cloudflared at /opt/homebrew/bin/cloudflared is shared, not ours
+```
+
+Clean up by hand in that case:
+
+```bash
+pgrep -lf "cloudflared tunnel .*localhost:7876"
+```
+
 ---
 
 ## 401 Unauthorized
@@ -529,10 +582,15 @@ unmistakable in the log:
 
 ```
 start() requested (port=7876, mode=named)
-spawning cloudflared: tunnel run --no-autoupdate --token <redacted-token-184-chars>
+spawning cloudflared: tunnel run --no-autoupdate
 cloudflared spawned, PID 16253
 cloudflared exited (status=0, reason=1)          ← ~40ms later
 ```
+
+The connector token is not in that line because it is passed through the
+`TUNNEL_TOKEN` environment variable: argv is readable by every process on the
+machine via `ps`, and the token alone is enough to publish traffic through
+your tunnel.
 
 `--no-autoupdate` is a `tunnel` subcommand flag, not a `run` flag. Placed
 after `run`, cloudflared rejects the CLI, prints help, and exits cleanly.
@@ -546,6 +604,53 @@ complaint.
 ```bash
 cloudflared tunnel --url http://127.0.0.1:7876
 ```
+
+### `Couldn't resolve the hostname` / `curl: (6) Could not resolve host`
+
+The menu shows a `*.trycloudflare.com` URL, cloudflared logged
+`Registered tunnel connection`, and nothing on the internet can reach it.
+The URL was never in DNS.
+
+Quick tunnels are assigned a hostname before the record is published, and
+occasionally Cloudflare never publishes it. cloudflared has no idea: from
+its side the connection to the edge is up and healthy, which is why the app
+used to show the URL as if it worked.
+
+Machook now checks. Within about 90 seconds of a URL appearing it fetches
+`<url>/health` from the outside and reports what it found:
+
+```bash
+curl -s http://127.0.0.1:7876/status | python3 -m json.tool | grep reach
+#   "tunnel_reachability": "unreachable",
+#   "tunnel_reachability_note": "hostname is not in DNS — Cloudflare never published it",
+```
+
+The menu bar line and Settings show the same warning. Confirm it yourself:
+
+```bash
+dig +short your-hostname.trycloudflare.com @1.1.1.1   # empty = NXDOMAIN
+dig +short trycloudflare.com @1.1.1.1                 # control: should answer
+```
+
+An empty answer for your hostname while the control resolves means the
+record was never published, and no amount of restarting the app changes
+that. What to do:
+
+1. **Restart tunnel** (`⌘T`) to request a different hostname. It often works
+   on the next attempt.
+2. If it keeps happening, switch to a **named tunnel** on a hostname you
+   own: Settings → **Tunnel** → Mode → **Named (custom domain)**. The DNS
+   record is one you created, so it cannot silently fail to exist.
+
+Other verdicts you may see in that field:
+
+| Note | Meaning |
+|---|---|
+| `Cloudflare has no connector for this hostname (1033)` | DNS resolves, the edge has no tunnel registered. Restart the tunnel. |
+| `tunnel is up but nothing answered locally (502)` | The tunnel works; our own listener is down or on another port. Check `local_api_port` in `/status`. |
+| `blocked by Cloudflare Access (403)` | An Access policy is challenging the request. Add a service-token bypass for the webhook path. |
+| `this Mac is offline` | No route to the internet from here. |
+| `timed out` / `cannot connect` / `TLS failed` | Transport-level failure to Cloudflare's edge; usually local network or a captive portal. |
 
 ### The quick-tunnel URL changed after a restart
 

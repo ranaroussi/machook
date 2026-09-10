@@ -32,6 +32,21 @@ public final class LocalAPIServer: @unchecked Sendable {
         var current: Int? { lock.lock(); defer { lock.unlock() }; return value }
     }
 
+    /// Whether the shutdown we're seeing is one we asked for.
+    ///
+    /// Hummingbird's service lifecycle traps `SIGTERM` and shuts the server
+    /// down gracefully, which arrives here as a perfectly normal return from
+    /// `runService()`. Without this flag that is indistinguishable from the
+    /// port change we initiated — so a `pkill` would leave a menu bar icon
+    /// with no listener behind it and nothing to say about why.
+    private final class StopFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var requested = false
+        func request() { lock.lock(); requested = true; lock.unlock() }
+        var wasRequested: Bool { lock.lock(); defer { lock.unlock() }; return requested }
+    }
+    private let stopFlag = StopFlag()
+
     /// `ports` is tried in order, and the first one that binds wins.
     public init(ports: [Int], tunnel: TunnelManager) {
         self.ports = ports.isEmpty ? [AppConfig.default.localAPIPort] : ports
@@ -45,6 +60,7 @@ public final class LocalAPIServer: @unchecked Sendable {
     public func start(onBound: @escaping @Sendable (Int) -> Void = { _ in }) {
         let ports = self.ports
         let tunnel = self.tunnel
+        let stopFlag = self.stopFlag
 
         task = Task.detached {
             let bound = BoundPort()
@@ -63,6 +79,11 @@ public final class LocalAPIServer: @unchecked Sendable {
                     "version": Self.versionString(),
                     "tunnel_url": tunnel?.publicURL ?? "",
                     "tunnel_running": tunnel?.isRunning ?? false,
+                    // "running" only means the child process is alive. Whether
+                    // the URL actually answers is a separate fact, and the one
+                    // a caller about to publish that URL needs.
+                    "tunnel_reachability": (tunnel?.reachability ?? .unknown).statusKeyword,
+                    "tunnel_reachability_note": (tunnel?.reachability ?? .unknown).menuNote ?? "",
                     // The bound port first: a caller needs the port that is
                     // serving, which is not always the configured one.
                     "local_api_port": bound.current ?? config.localAPIPort,
@@ -114,12 +135,16 @@ public final class LocalAPIServer: @unchecked Sendable {
                 Log.api.info("starting listener on 127.0.0.1:\(port)")
                 do {
                     try await app.runService()
-                    // Returning without an error means an orderly shutdown.
-                    ServerStatus.report(listening: false, port: port)
+                    // An orderly shutdown — but orderly is not the same as
+                    // intended. If nobody asked for this, the most likely
+                    // cause is a SIGTERM the service lifecycle handled on our
+                    // behalf, which leaves the app running with nothing
+                    // serving. Say so rather than going quiet.
+                    Self.reportShutdown(port: port, requested: stopFlag.wasRequested)
                     return
                 } catch is CancellationError {
                     Log.api.info("listener on port \(port) stopped")
-                    ServerStatus.report(listening: false, port: port)
+                    Self.reportShutdown(port: port, requested: stopFlag.wasRequested)
                     return
                 } catch {
                     // Only move ports when we never got this one. Retrying
@@ -140,9 +165,23 @@ public final class LocalAPIServer: @unchecked Sendable {
     }
 
     public func stop() {
+        stopFlag.request()
         task?.cancel()
         task = nil
         ServerStatus.report(listening: false, port: ports.first ?? 0)
+    }
+
+    /// Report a listener that is no longer serving, distinguishing a
+    /// shutdown we asked for from one that happened to us.
+    static func reportShutdown(port: Int, requested: Bool) {
+        if requested {
+            ServerStatus.report(listening: false, port: port)
+            return
+        }
+        let detail = "The HTTP listener on port \(port) stopped on its own. "
+            + "Quit and reopen Machook to start serving again."
+        Log.api.error("listener stopped unexpectedly on port \(port)")
+        ServerStatus.report(listening: false, port: port, error: detail)
     }
 
     private static func isPortUnavailable(_ error: Error) -> Bool {

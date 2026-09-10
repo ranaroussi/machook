@@ -261,6 +261,26 @@ public struct SettingsView: View {
                 }
             }
 
+            // Having a URL and being reachable are different facts, and only
+            // the second one matters to whoever is about to paste it into a
+            // webhook provider.
+            if config.tunnelEnabled, let url = tunnelStatus.publicURL, !url.isEmpty {
+                switch tunnelStatus.reachability {
+                case .unreachable(let why):
+                    warningCard("""
+                    \(url) is published but not answering: \(why). \
+                    Quick tunnels sometimes never get a DNS record — a named \
+                    tunnel on a hostname you own avoids this entirely.
+                    """)
+                case .checking:
+                    Text("Checking that \(url) answers…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                case .reachable, .unknown:
+                    EmptyView()
+                }
+            }
+
             section("MCP") {
                 row("Expose endpoints as MCP tools",
                     help: "Serves POST /mcp on the same URL and token. Individual endpoints opt in when you edit them.") {

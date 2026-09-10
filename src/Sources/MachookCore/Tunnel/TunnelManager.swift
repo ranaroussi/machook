@@ -21,6 +21,25 @@ public final class TunnelManager: @unchecked Sendable {
     public private(set) var isRunning = false
     public private(set) var publicURL: String?
     private let urlLock = NSLock()
+    /// In-flight reachability verification for the current URL.
+    private var probeTask: Task<Void, Never>?
+
+    /// Verification state, kept here rather than only on the `@MainActor`
+    /// `TunnelStatus` so `GET /status` can read it without hopping actors —
+    /// the same split already used for `publicURL`.
+    private let reachLock = NSLock()
+    private var reachabilityState: TunnelStatus.Reachability = .unknown
+    public var reachability: TunnelStatus.Reachability {
+        reachLock.lock(); defer { reachLock.unlock() }
+        return reachabilityState
+    }
+
+    private func setReachability(_ next: TunnelStatus.Reachability) {
+        reachLock.lock()
+        reachabilityState = next
+        reachLock.unlock()
+        Task { @MainActor in TunnelStatus.shared.reachability = next }
+    }
 
     public init() {}
 
@@ -28,6 +47,10 @@ public final class TunnelManager: @unchecked Sendable {
     /// recognize "the tunnel is live" from its stderr.
     private struct Runtime: Sendable {
         let arguments: [String]
+        /// Extra environment for the child. Secrets travel here rather than
+        /// in `arguments`, because argv is world-readable through `ps` while
+        /// another user's environment is not.
+        let environment: [String: String]
         /// Maps a stderr chunk → the public URL the tunnel will be
         /// reachable at, or `nil` if this chunk doesn't yet signal
         /// readiness. Called repeatedly until it returns non-nil.
@@ -80,8 +103,9 @@ public final class TunnelManager: @unchecked Sendable {
             return
         }
 
-        // Log the argv (redact the token if present so it doesn't
-        // hit the system log).
+        // The token now travels in the environment, so argv is already free
+        // of secrets. The redaction stays as a guard in case a future flag
+        // reintroduces one.
         let safeArgs = runtime.arguments.enumerated().map { idx, arg -> String in
             if idx > 0, runtime.arguments[idx - 1] == "--token" {
                 return "<redacted-token-\(arg.count)-chars>"
@@ -93,6 +117,12 @@ public final class TunnelManager: @unchecked Sendable {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: execPath)
         process.arguments = runtime.arguments
+        if !runtime.environment.isEmpty {
+            // Merge rather than replace: a bare environment would strip PATH
+            // and HOME out from under cloudflared.
+            process.environment = ProcessInfo.processInfo.environment
+                .merging(runtime.environment) { _, new in new }
+        }
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -124,6 +154,9 @@ public final class TunnelManager: @unchecked Sendable {
                 }
                 Log.tunnel.info("named-mode publicURL pre-populated from config: \(synchronousURL, privacy: .public)")
                 resolver.fire(synchronousURL)
+                // Pre-populating is a guess about where traffic will land, not
+                // evidence that it does. Start proving it.
+                beginReachabilityProbe(for: synchronousURL)
             }
         }
 
@@ -131,11 +164,18 @@ public final class TunnelManager: @unchecked Sendable {
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
 
-            // Surface the raw stderr too — at debug level only so we
-            // don't spam the log in steady state, but available when
-            // diagnosing connection failures.
+            // Surface the child's output. Routine chatter stays at debug so
+            // steady state is quiet, but anything that looks like a failure
+            // is promoted, because `log show` drops debug-level records
+            // unless explicitly asked for them — which is how a tunnel that
+            // died after startup used to leave no trace at all.
             for line in text.split(separator: "\n") where !line.isEmpty {
-                Log.tunnel.debug("cloudflared: \(line, privacy: .public)")
+                let entry = String(line)
+                switch Self.logLevel(forCloudflaredLine: entry) {
+                case .debug:  Log.tunnel.debug("cloudflared: \(entry, privacy: .public)")
+                case .notice: Log.tunnel.notice("cloudflared: \(entry, privacy: .public)")
+                case .error:  Log.tunnel.error("cloudflared: \(entry, privacy: .public)")
+                }
             }
 
             guard let url = runtime.urlExtractor(text) else { return }
@@ -153,6 +193,9 @@ public final class TunnelManager: @unchecked Sendable {
                 TunnelStatus.shared.publicURL = url
                 TunnelStatus.shared.isRunning = true
             }
+            // A printed URL is a claim, not a fact. Verify it before the menu
+            // invites anyone to point a webhook at it.
+            self.beginReachabilityProbe(for: url)
         }
 
         stdout.fileHandleForReading.readabilityHandler = consume
@@ -164,6 +207,8 @@ public final class TunnelManager: @unchecked Sendable {
             Log.tunnel.notice("cloudflared exited (status=\(status), reason=\(reason.rawValue))")
             stdout.fileHandleForReading.readabilityHandler = nil
             stderr.fileHandleForReading.readabilityHandler = nil
+            self?.probeTask?.cancel()
+            self?.setReachability(.unknown)
             DispatchQueue.main.async {
                 self?.isRunning = false
                 self?.publicURL = nil
@@ -197,6 +242,8 @@ public final class TunnelManager: @unchecked Sendable {
     /// and a stale child would make the new one register against the
     /// wrong tunnel — or fail to register at all if a port is bound.
     public func stop() {
+        probeTask?.cancel()
+        probeTask = nil
         guard isRunning, let process else { return }
         let pid = process.processIdentifier
         Log.tunnel.info("stop() sending SIGTERM to cloudflared PID \(pid)")
@@ -221,6 +268,7 @@ public final class TunnelManager: @unchecked Sendable {
         self.process = nil
         isRunning = false
         publicURL = nil
+        setReachability(.unknown)
         Task { @MainActor in
             TunnelStatus.shared.publicURL = nil
             TunnelStatus.shared.isRunning = false
@@ -239,6 +287,7 @@ public final class TunnelManager: @unchecked Sendable {
             let pattern = "https://[a-z0-9-]+\\.trycloudflare\\.com"
             return Runtime(
                 arguments: ["tunnel", "--no-autoupdate", "--url", "http://localhost:\(port)"],
+                environment: [:],
                 urlExtractor: { text in
                     guard let range = text.range(of: pattern, options: .regularExpression) else { return nil }
                     return String(text[range])
@@ -266,12 +315,228 @@ public final class TunnelManager: @unchecked Sendable {
             // BEFORE `run` or cloudflared rejects it with
             // "flag provided but not defined", prints help, and
             // exits 0 within ~40ms.
+            //
+            // The token goes through TUNNEL_TOKEN rather than `--token`
+            // because argv is visible to every process on the machine via
+            // `ps`, and this token alone is enough to publish traffic
+            // through the user's tunnel. cloudflared reads the variable for
+            // `tunnel run` and needs no positional tunnel name when it is
+            // set.
             return Runtime(
-                arguments: ["tunnel", "--no-autoupdate", "run", "--token", token],
+                arguments: ["tunnel", "--no-autoupdate", "run"],
+                environment: ["TUNNEL_TOKEN": token],
                 urlExtractor: { text in
                     text.contains("Registered tunnel connection") ? publicURL : nil
                 }
             )
+        }
+    }
+
+    // MARK: - Reachability
+
+    /// Probe the published URL until it answers, or until we're confident it
+    /// never will.
+    ///
+    /// `/health` is the target because it is the one route that needs no
+    /// bearer token, so the probe works regardless of how auth is configured
+    /// and proves the whole path: DNS → Cloudflare edge → connector → our
+    /// listener.
+    private func beginReachabilityProbe(for url: String) {
+        probeTask?.cancel()
+
+        let base = url.hasSuffix("/") ? String(url.dropLast()) : url
+        guard let target = URL(string: base + "/health") else { return }
+
+        setReachability(.checking)
+
+        probeTask = Task.detached { [weak self] in
+            // A single failure means nothing: DNS for a fresh quick tunnel can
+            // take a few seconds to publish, and a named tunnel's connector
+            // needs time to register. Fibonacci backoff spans ~87s in 8
+            // attempts, which is long enough to outlast a slow start without
+            // leaving the menu ambiguous for minutes.
+            let delays: [UInt64] = [1, 2, 3, 5, 8, 13, 21, 34]
+            var outcome: TunnelStatus.Reachability = .checking
+
+            for (attempt, delay) in delays.enumerated() {
+                if Task.isCancelled { return }
+                try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+                if Task.isCancelled { return }
+                // Stopped, or restarted onto a different URL, while we waited.
+                guard let self, self.isRunning, self.publicURL == url else { return }
+
+                outcome = await Self.probeOnce(target)
+                if outcome == .reachable {
+                    Log.tunnel.info("tunnel verified reachable: \(url, privacy: .public)")
+                    self.setReachability(.reachable)
+                    return
+                }
+                Log.tunnel.debug("probe \(attempt + 1)/\(delays.count) failed for \(url, privacy: .public)")
+            }
+
+            if Task.isCancelled { return }
+            if case .unreachable(let why) = outcome {
+                Log.tunnel.error("tunnel never became reachable: \(url, privacy: .public) — \(why, privacy: .public)")
+            }
+            self?.setReachability(outcome)
+        }
+    }
+
+    private static func probeOnce(_ url: URL) async -> TunnelStatus.Reachability {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 10
+        // Cloudflare's edge error pages are cacheable; a cached 530 would
+        // outlive the condition it describes.
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            return classifyProbe(statusCode: (response as? HTTPURLResponse)?.statusCode, error: nil)
+        } catch {
+            return classifyProbe(statusCode: nil, error: error)
+        }
+    }
+
+    /// Turn the outcome of one probe request into a state the menu can show.
+    ///
+    /// Separated from the request itself so the interesting cases are
+    /// testable without a network: each one produces a different instruction
+    /// for the user, and getting them confused is worse than saying nothing.
+    static func classifyProbe(statusCode: Int?, error: Error?) -> TunnelStatus.Reachability {
+        if let statusCode {
+            switch statusCode {
+            case 200:
+                return .reachable
+            // Cloudflare's own edge errors. 530 is served for 1033 ("tunnel
+            // not found / not connected"), which means DNS resolved but no
+            // connector is registered for that hostname.
+            case 530:
+                return .unreachable("Cloudflare has no connector for this hostname (1033)")
+            case 502, 503, 504:
+                return .unreachable("tunnel is up but nothing answered locally (\(statusCode))")
+            case 403:
+                return .unreachable("blocked by Cloudflare Access (403)")
+            default:
+                return .unreachable("tunnel answered \(statusCode)")
+            }
+        }
+
+        guard let error else { return .unreachable("no response") }
+
+        let code = (error as NSError).code
+        switch code {
+        case NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed:
+            // The failure this exists for. Quick tunnels get a hostname
+            // assigned before — and sometimes without ever — a DNS record
+            // being published, so name the cause and the way out.
+            return .unreachable("hostname is not in DNS — Cloudflare never published it")
+        case NSURLErrorTimedOut:
+            return .unreachable("timed out")
+        case NSURLErrorCannotConnectToHost, NSURLErrorNetworkConnectionLost:
+            return .unreachable("cannot connect")
+        case NSURLErrorNotConnectedToInternet:
+            return .unreachable("this Mac is offline")
+        case NSURLErrorSecureConnectionFailed, NSURLErrorServerCertificateUntrusted:
+            return .unreachable("TLS failed")
+        default:
+            return .unreachable("unreachable")
+        }
+    }
+
+    /// How loudly to log a line of `cloudflared` output.
+    ///
+    /// All of it used to go to `.debug`, which `log show` drops unless asked
+    /// for explicitly — so a tunnel that failed after startup left no trace
+    /// in a default log capture. Errors and warnings are promoted so they
+    /// persist, while the routine chatter stays at debug where it belongs.
+    enum CloudflaredLogLevel: Equatable, Sendable { case debug, notice, error }
+
+    static func logLevel(forCloudflaredLine line: String) -> CloudflaredLogLevel {
+        // cloudflared's own level tags, e.g. "2026-09-10T12:45:50Z ERR …".
+        if line.contains(" ERR ") { return .error }
+        if line.contains(" WRN ") { return .notice }
+        let lowered = line.lowercased()
+        for needle in ["failed to", "cannot", "unauthorized", "not valid", "rate limit", "429"] {
+            if lowered.contains(needle) { return .error }
+        }
+        for needle in ["retrying", "unregistered", "connection terminated", "no more connections"] {
+            if lowered.contains(needle) { return .notice }
+        }
+        return .debug
+    }
+
+    // MARK: - Stray process reaping
+
+    /// PIDs of `cloudflared` processes started from `executablePath` that we
+    /// are not currently supervising.
+    ///
+    /// A force-quit or a crash leaves our child reparented to launchd, still
+    /// holding a tunnel pointed at a port a later instance will serve. The
+    /// filter is deliberately narrow — an exact match on the executable path
+    /// we launch, which for a release build is inside our own bundle — so a
+    /// dev build resolving `cloudflared` from Homebrew can never sweep up
+    /// tunnels belonging to other apps or to the user.
+    static func strayPIDs(
+        psOutput: String,
+        executablePath: String,
+        excluding excluded: Set<Int32>
+    ) -> [Int32] {
+        var pids: [Int32] = []
+        for rawLine in psOutput.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            // Format: "<pid> <command with args…>"
+            guard let spaceIndex = line.firstIndex(of: " ") else { continue }
+            guard let pid = Int32(line[line.startIndex..<spaceIndex]) else { continue }
+            let command = line[line.index(after: spaceIndex)...].trimmingCharacters(in: .whitespaces)
+            guard command == executablePath || command.hasPrefix(executablePath + " ") else { continue }
+            guard !excluded.contains(pid), pid != ProcessInfo.processInfo.processIdentifier else { continue }
+            pids.append(pid)
+        }
+        return pids
+    }
+
+    /// Terminate leftover `cloudflared` children from a previous run.
+    ///
+    /// Only ever runs against a binary inside our own app bundle: if
+    /// `cloudflared` was resolved from Homebrew or the PATH, that same path
+    /// is shared with every other tunnel on the machine, and the user's own
+    /// unrelated tunnels are not ours to kill.
+    public func reapStrayProcesses() {
+        guard let execPath = locateCloudflared() else { return }
+        let bundlePath = Self.absolutePath(Bundle.main.bundlePath)
+        guard execPath.hasPrefix(bundlePath + "/") else {
+            Log.tunnel.debug("skipping stray sweep: cloudflared at \(execPath, privacy: .public) is shared, not ours")
+            return
+        }
+
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-axo", "pid=,command="]
+        let pipe = Pipe()
+        ps.standardOutput = pipe
+        ps.standardError = FileHandle.nullDevice
+
+        let output: String
+        do {
+            try ps.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            ps.waitUntilExit()
+            output = String(data: data, encoding: .utf8) ?? ""
+        } catch {
+            Log.tunnel.notice("stray sweep skipped: could not run ps (\(error.localizedDescription, privacy: .public))")
+            return
+        }
+
+        var excluded = Set<Int32>()
+        if let current = process?.processIdentifier { excluded.insert(current) }
+
+        let strays = Self.strayPIDs(psOutput: output, executablePath: execPath, excluding: excluded)
+        guard !strays.isEmpty else { return }
+
+        for pid in strays {
+            Log.tunnel.notice("reaping stray cloudflared PID \(pid) from a previous run")
+            kill(pid, SIGTERM)
         }
     }
 
@@ -309,10 +574,27 @@ public final class TunnelManager: @unchecked Sendable {
         }
     }
 
+    /// Resolve against the working directory so the path we launch — and
+    /// therefore the one `ps` reports for the child — is always absolute.
+    ///
+    /// Launching the app from a shell by a relative path (`./Machook.app/…`)
+    /// makes `Bundle.main` relative too, and a child recorded as
+    /// `./Machook.app/Contents/Resources/cloudflared` will not match the
+    /// absolute path the stray sweep looks for. Normalising here fixes the
+    /// cause instead of teaching the matcher to guess.
+    static func absolutePath(_ path: String) -> String {
+        guard !path.hasPrefix("/") else {
+            return URL(fileURLWithPath: path).standardizedFileURL.path
+        }
+        let cwd = FileManager.default.currentDirectoryPath
+        return URL(fileURLWithPath: path, relativeTo: URL(fileURLWithPath: cwd, isDirectory: true))
+            .standardizedFileURL.path
+    }
+
     private func locateCloudflared() -> String? {
         if let bundled = Bundle.main.url(forResource: "cloudflared", withExtension: nil),
            FileManager.default.isExecutableFile(atPath: bundled.path) {
-            return bundled.path
+            return Self.absolutePath(bundled.path)
         }
         let candidates = ["/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared", "/usr/bin/cloudflared"]
         for c in candidates where FileManager.default.isExecutableFile(atPath: c) {

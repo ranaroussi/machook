@@ -93,7 +93,7 @@ cd machook
 make app        # build + bundle + sign  →  ./Machook.app
 make install    # same, then copy to /Applications
 make run        # build and launch
-make test       # 44 unit tests
+make test       # 67 unit tests
 ```
 
 Requirements: macOS 14+, Swift 6.0+ (Xcode command line tools are enough), and `cloudflared` if you want the bundler to pick up a local copy rather than downloading one.
@@ -337,6 +337,8 @@ Machook runs arbitrary commands on your Mac in response to network requests. Tha
 
 `cloudflared` ships inside the app bundle; Machook supervises it, parses the URL out of its output, restarts it if it dies, and shows the current URL in the menu bar (click to copy). Full walkthrough in [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md).
 
+The URL is verified before it is presented as working. Quick tunnels are occasionally handed a hostname Cloudflare never publishes in DNS — cloudflared reports a healthy connection while nothing on the internet can resolve you — so Machook fetches the public URL's `/health` from the outside and reports what it found. A URL that never answered is shown with the reason (`⚠ … — hostname is not in DNS`) rather than looking ready. If it keeps happening, switch to a named tunnel: that DNS record is one you own.
+
 ## Configuration
 
 Everything lives in `UserDefaults` under `com.machook.app`, key `machook.config.v1`, and is edited from Settings. Unknown or missing keys fall back to defaults, so upgrades never reset your endpoint table.
@@ -371,6 +373,7 @@ Everything lives in `UserDefaults` under `com.machook.app`, key `machook.config.
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7876/status
 {"ok":true,"version":"0.1.0","tunnel_url":"https://…","tunnel_running":true,
+ "tunnel_reachability":"reachable","tunnel_reachability_note":"",
  "local_api_port":7876,"configured_api_port":7876,
  "endpoints_total":6,"endpoints_enabled":5,
  "mcp_enabled":true,"mcp_tools":2,"active_runs":0}
@@ -378,12 +381,14 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7876/status
 
 `local_api_port` is the port actually serving; `configured_api_port` is the one in Settings. They differ when the fallback is in use.
 
+`tunnel_running` means the `cloudflared` process is alive. `tunnel_reachability` means the URL was fetched from the outside and answered — `unknown`, `checking`, `reachable`, or `unreachable` with the reason in `tunnel_reachability_note`. Quick tunnels are occasionally handed a hostname Cloudflare never publishes in DNS, and that combination (`running: true`, `unreachable`) is the only warning you will get.
+
 ## Development
 
 ```bash
 cd src
 swift build            # debug
-swift test             # 44 tests: quoting, templating, envelope, runner, ports
+swift test             # 67 tests: quoting, templating, envelope, runner, ports, tunnel
 swift build -c release
 
 cd .. && make app      # bundle + sign

@@ -238,10 +238,19 @@ log "Verifying architectures (${SWIFT_ARCHS[*]})"
 # dyld crash on a user's Mac, on the machines this build exists to serve.
 # Sparkle counts as much as our own executable: a missing slice in a linked
 # framework takes the whole app down at launch, not just the updater.
+# Sparkle is addressed through its version symlink, not the current letter
+# ("B"): a hardcoded letter that stops matching makes the check below skip
+# the framework entirely and pass, which is the one outcome a verification
+# gate must never do.
+SPARKLE_BIN="Contents/Frameworks/Sparkle.framework/Versions/Current/Sparkle"
+if [ -d "$APP_DIR/Contents/Frameworks/Sparkle.framework" ] && [ ! -f "$APP_DIR/$SPARKLE_BIN" ]; then
+    die "Sparkle.framework is bundled but $SPARKLE_BIN does not resolve — cannot verify its slices"
+fi
+
 for rel in \
     "Contents/MacOS/$EXECUTABLE_NAME" \
     "Contents/Resources/cloudflared" \
-    "Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle"
+    "$SPARKLE_BIN"
 do
     bin="$APP_DIR/$rel"
     [ -f "$bin" ] || continue

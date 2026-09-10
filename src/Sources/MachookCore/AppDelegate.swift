@@ -1,4 +1,5 @@
 import Cocoa
+import Combine
 import SwiftUI
 import Sparkle
 
@@ -29,6 +30,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     /// configured primary.
     private var boundPort: Int?
 
+    /// Held for the process lifetime: a released signal source stops firing.
+    private var signalSources: [DispatchSourceSignal] = []
+
+    /// Redraws the menu when tunnel reachability resolves, since that arrives
+    /// up to ~90s after the tunnel starts rather than in response to a click.
+    private var statusObservers: [AnyCancellable] = []
+
     public override init() {
         super.init()
     }
@@ -49,6 +57,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
 
         installMainMenu()
         setupMenuBar()
+        installSignalHandlers()
         bootRuntime()
 
         NotificationCenter.default.addObserver(
@@ -73,6 +82,31 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         tunnel?.stop()
     }
 
+    /// Quit properly on `SIGTERM`/`SIGINT` instead of half-dying.
+    ///
+    /// Hummingbird's service lifecycle traps `SIGTERM` and gracefully stops
+    /// the HTTP server, but nothing stops the AppKit run loop — so a plain
+    /// `pkill Machook` used to leave a live menu bar app with no listener,
+    /// and a `cloudflared` child reparented to launchd, still holding a
+    /// tunnel aimed at a port the next instance would try to serve. Routing
+    /// the signal through `NSApp.terminate` runs
+    /// `applicationWillTerminate`, which shuts both of those down.
+    ///
+    /// `signal(_:SIG_IGN)` is required: the default disposition would kill
+    /// the process before the dispatch source ever ran.
+    private func installSignalHandlers() {
+        for sig in [SIGTERM, SIGINT] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler {
+                Log.app.notice("received signal \(sig) — terminating cleanly")
+                NSApp.terminate(nil)
+            }
+            source.resume()
+            signalSources.append(source)
+        }
+    }
+
     // MARK: Runtime
 
     /// No permission gate here, deliberately: Machook reads no protected
@@ -85,6 +119,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
 
         let config = AppConfigStore.shared.current
         let tunnel = TunnelManager()
+
+        // Same idea as the envelope sweep, for processes: a force-quit can't
+        // run our cleanup, so a previous run's cloudflared may still be up and
+        // publishing a tunnel to this port.
+        tunnel.reapStrayProcesses()
         let api = LocalAPIServer(ports: config.listenPortCandidates(), tunnel: tunnel)
 
         self.tunnel = tunnel
@@ -96,6 +135,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         api.start { [weak self] port in
             Task { @MainActor in self?.listenerDidBind(port: port) }
         }
+
+        // The menu is normally rebuilt on open, but reachability resolves on
+        // its own schedule — nobody is holding the menu open 90 seconds later
+        // to see it change.
+        statusObservers = [
+            TunnelStatus.shared.$reachability
+                .receive(on: RunLoop.main)
+                .sink { [weak self] _ in self?.refreshMenu() },
+            ServerStatus.shared.$lastError
+                .receive(on: RunLoop.main)
+                .sink { [weak self] _ in self?.refreshMenu() }
+        ]
 
         lastSnapshot = snapshot(of: config)
         refreshMenu()
@@ -263,9 +314,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
             menu.addItem(.separator())
         }
 
+        // A URL on its own reads as "ready". When we haven't confirmed it
+        // answers — or know it doesn't — the line has to say which, or the
+        // menu is quietly recommending a dead address.
+        let reachability = TunnelStatus.shared.reachability
         let tunnelLine: String
         if let url = tunnel?.publicURL, !url.isEmpty {
-            tunnelLine = url
+            switch reachability {
+            case .unreachable(let why):
+                tunnelLine = "⚠ \(url) — \(why)"
+            case .checking:
+                tunnelLine = "\(url) — verifying…"
+            case .reachable, .unknown:
+                tunnelLine = url
+            }
         } else if config.tunnelEnabled {
             tunnelLine = "Tunnel: connecting…"
         } else {
@@ -276,7 +338,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
             tunnelItem.target = self
             tunnelItem.action = #selector(copyTunnelURL)
             tunnelItem.isEnabled = true
-            tunnelItem.toolTip = "Click to copy"
+            switch reachability {
+            case .unreachable(let why):
+                tunnelItem.toolTip = "\(url) is not answering: \(why). Click to copy anyway."
+            case .checking:
+                tunnelItem.toolTip = "Checking that \(url) answers. Click to copy."
+            case .reachable:
+                tunnelItem.toolTip = "Verified reachable. Click to copy."
+            case .unknown:
+                tunnelItem.toolTip = "Click to copy"
+            }
         }
         menu.addItem(tunnelItem)
 

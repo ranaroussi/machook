@@ -16,7 +16,7 @@ cd src && swift test
 make test
 ```
 
-44 tests across 7 suites. They exercise the security boundary and the
+67 tests across 8 suites. They exercise the security boundary and the
 process runner directly rather than only through a live request, so a
 regression in quoting or timeout handling fails here before it ever
 reaches an HTTP surface.
@@ -28,7 +28,8 @@ reaches an HTTP surface.
 | `EndpointRuleTests` | `TemplateAndQuotingTests.swift` | Path normalization (`ep1`, `/ep1/`, pasted tunnel URL, query string), tool-name derivation, case-insensitive method matching, every validation rule |
 | `AppConfigTests` | `TemplateAndQuotingTests.swift` | Tool-name collision suffixing, enabled-vs-exists lookup, MCP catalog filtering, decoding a config that predates a new field without losing endpoints |
 | `RequestEnvelopeTests` | `TemplateAndQuotingTests.swift` | JSON body parsed into `body` and mirrored to `body_raw`, non-JSON body still delivered as text, binary body falling back to `body_base64`, written file is mode `0600` and not under `/tmp` |
-| `ListenerFallbackTests` | `ListenerFallbackTests.swift` | A real occupied loopback socket: the listener skips the taken port for the fallback and serves `/health` there; with no fallback left, the failure surfaces on `ServerStatus` naming the port and the conflict |
+| `ListenerFallbackTests` | `ListenerFallbackTests.swift` | A real occupied loopback socket: the listener skips the taken port for the fallback and serves `/health` there; with no fallback left, the failure surfaces on `ServerStatus` naming the port and the conflict; a shutdown nobody requested raises a visible error while a requested one stays quiet |
+| `TunnelSupervisionTests` | `TunnelSupervisionTests.swift` | Reachability verdicts from probe outcomes (NXDOMAIN named as DNS, `530` as Cloudflare 1033, `502` as a local miss, offline, unexpected status); which cloudflared output gets promoted out of debug; stray-PID matching, including that another app's or Homebrew's tunnel is **never** a candidate, that a path prefix does not match, and that the supervised child is excluded; relative launch paths resolved to absolute |
 | `CommandRunnerTests` | `CommandRunnerTests.swift` | Real shells: stdout capture, non-zero exit with stderr, envelope readable byte-for-byte, **shell metacharacters in a payload do not execute**, `MACHOOK_REQUEST_FILE`, keep-request-files, stdin is `/dev/null` so `cat` doesn't hang, timeout kills the child, output cap without breaking completion, working directory, concurrency rejection, bad placeholder failing before spawn |
 
 `CommandRunnerTests` spawns real `zsh` processes (with `loginShell =
@@ -220,6 +221,7 @@ curl -sS "${AUTH[@]}" "$BASE/status" | jq
 # {
 #   "ok": true, "version": "0.1.0",
 #   "tunnel_url": "", "tunnel_running": false,
+#   "tunnel_reachability": "unknown", "tunnel_reachability_note": "",
 #   "local_api_port": 7876, "configured_api_port": 7876,
 #   "endpoints_total": 6, "endpoints_enabled": 5,
 #   "mcp_enabled": true, "mcp_tools": 5,
@@ -233,6 +235,10 @@ straight out of `src/.build` reports `0.0.0`.
 `local_api_port` is the port actually bound and `configured_api_port` is
 the one in Settings. If they differ, the primary port was taken and the
 fallback is serving — call that port, not the configured one.
+
+`tunnel_reachability` is `unknown` until a tunnel URL exists, then
+`checking` while the URL is probed from the outside, then `reachable` or
+`unreachable` with the reason in `tunnel_reachability_note`. See §10a.
 
 ---
 
@@ -671,6 +677,111 @@ log show --predicate 'subsystem == "com.machook.app" && category == "app"' \
   --info --last 2m | grep "port changed"
 ```
 
+### 10a. The URL is verified, not assumed
+
+A quick tunnel can be handed a hostname Cloudflare never publishes in DNS.
+cloudflared logs `Registered tunnel connection` and stays alive, so every
+other signal says healthy while nothing on the internet can reach you.
+Machook fetches `<url>/health` from the outside and reports what happened.
+
+```bash
+# With the tunnel on, watch the verdict resolve. It can take ~90s in the
+# worst case: retries back off 1,2,3,5,8,13,21,34s.
+for i in $(seq 1 12); do
+  curl -sS "${AUTH[@]}" "$BASE/status" \
+    | jq -r '"\(.tunnel_reachability)\t\(.tunnel_reachability_note)"'
+  sleep 10
+done
+# checking      verifying…
+# checking      verifying…
+# reachable
+```
+
+Healthy path: `reachable`, and the menu bar shows the bare URL.
+
+Failure path (real, and the reason this exists) — the hostname never
+enters DNS:
+
+```
+# unreachable   hostname is not in DNS — Cloudflare never published it
+```
+
+Confirm the app is telling the truth rather than inventing a failure:
+
+```bash
+HOST=$(curl -sS "${AUTH[@]}" "$BASE/status" | jq -r .tunnel_url | sed 's|https://||')
+dig +short "$HOST" @1.1.1.1          # empty = NXDOMAIN, app is right
+dig +short trycloudflare.com @1.1.1.1 # control: must answer
+curl -sS -m 8 "https://$HOST/health"  # curl: (6) Could not resolve host
+```
+
+Also check the surfaces, since `/status` is not where a user looks:
+
+```
+# Menu bar:  ⚠ https://… — hostname is not in DNS — Cloudflare never published it
+# Settings → Tunnel: an orange card saying the same, suggesting a named tunnel.
+```
+
+Then `⌘T` (Restart tunnel) — a new hostname is requested and the probe
+starts over from `checking`. Turning the tunnel off returns the state to
+`unknown`.
+
+### 10b. Signals and leftover processes
+
+An older build treated `pkill Machook` as a listener shutdown: the app
+stayed in the menu bar with a dead port. And a force-quit left its
+`cloudflared` child running against the port the next launch would use.
+
+```bash
+# 1. SIGTERM must quit the whole app, not just the listener.
+open /Applications/Machook.app && sleep 5
+curl -sS http://127.0.0.1:7876/health          # {"ok":true}
+kill -TERM "$(pgrep -x Machook)" && sleep 3
+pgrep -x Machook || echo "app exited"
+log show --predicate 'subsystem == "com.machook.app" && category == "app"' \
+  --info --last 2m | grep signal
+#   received signal 15 — terminating cleanly
+
+# A clean quit also takes the tunnel child with it:
+pgrep -lf "Machook.app/Contents/Resources/cloudflared" || echo "no strays"
+```
+
+```bash
+# 2. An orphan from a force-quit is reaped at the next launch.
+#    (Tunnel must be ON so there is a child to orphan.)
+open /Applications/Machook.app && sleep 8
+CF=$(pgrep -f "Machook.app/Contents/Resources/cloudflared" | head -1)
+kill -9 "$(pgrep -x Machook)" && sleep 3
+ps -o pid,ppid= -p "$CF"        # still alive, parent is now 1 (launchd)
+
+open /Applications/Machook.app && sleep 7
+kill -0 "$CF" 2>/dev/null && echo "FAIL: orphan survived" || echo "reaped"
+log show --predicate 'subsystem == "com.machook.app" && category == "tunnel"' \
+  --info --last 2m | grep -i stray
+#   reaping stray cloudflared PID 54039 from a previous run
+```
+
+The sweep must be narrow enough to be safe. If you have your own
+`cloudflared` tunnels running, count them before and after — the number
+must not change:
+
+```bash
+pgrep -cf "/opt/homebrew/bin/cloudflared"
+```
+
+A dev build that resolved `cloudflared` from Homebrew sweeps nothing at
+all, on purpose, and says so:
+
+```
+skipping stray sweep: cloudflared at /opt/homebrew/bin/cloudflared is shared, not ours
+```
+
+```bash
+# 3. cloudflared failures must survive a default log capture (no --debug).
+log show --predicate 'subsystem == "com.machook.app" && category == "tunnel"' \
+  --info --last 10m | grep -E "ERR|WRN|terminated|retrying"
+```
+
 ---
 
 ## 11. Port conflicts
@@ -763,6 +874,9 @@ when a named tunnel or a webhook provider has one exact port saved.
 | Tunnel ON with an empty bearer token | Orange warning card, and Save raises "Publish endpoints without a token?" with a destructive "Publish anyway" |
 | Endpoint editor → **Test** | Runs the unsaved draft; shows `exit 0 · 34 ms` plus stdout/stderr, or "(no output)" |
 | Menu with a live tunnel | URL line is clickable and copies |
+| Menu while the URL is being probed | `<url> — verifying…`, tooltip says it is being checked |
+| Menu with a tunnel that never answered | `⚠ <url> — <reason>`; still copyable, tooltip explains why |
+| Reachability resolving while the menu is closed | The line updates on its own — the verdict can land 90 s after launch, so the menu is redrawn from an observer rather than only on open |
 | Menu with >8 enabled endpoints | Shows 8 rows plus "… and N more" |
 | Menu → Restart tunnel (`⌘T`) | Tunnel stops and comes back (new URL in free mode) |
 | Settings → General → Launch at login | Toggle sticks; reverts itself if the system refuses |

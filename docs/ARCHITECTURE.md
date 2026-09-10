@@ -130,16 +130,19 @@ AppDelegate.applicationDidFinishLaunching
    │      ├── yes → SPUStandardUpdaterController(startingUpdater: true)
    │      └── no  → skip Sparkle entirely (it aborts hard on a missing key)
    │
-   ├── installMainMenu()   → NSApp.mainMenu with App + Edit submenus
-   ├── setupMenuBar()      → NSStatusItem + NSMenu (delegate = self)
+   ├── installMainMenu()      → NSApp.mainMenu with App + Edit submenus
+   ├── setupMenuBar()         → NSStatusItem + NSMenu (delegate = self)
+   ├── installSignalHandlers() → SIGTERM/SIGINT → NSApp.terminate
    └── bootRuntime()
         │
         ├── RequestEnvelope.sweepStagingDirectory()   # drop envelopes >6h old
         ├── TunnelManager()
+        ├── tunnel.reapStrayProcesses()               # orphans from a crash
         ├── LocalAPIServer(ports: config.listenPortCandidates(), tunnel:)
         ├── api.start { port in listenerDidBind(port:) }   # detached Task
         │      └── tries each candidate port in order; the tunnel is
         │          started from this callback, never before it
+        ├── statusObservers on $reachability and $lastError → refreshMenu()
         ├── lastSnapshot = snapshot(of: config)
         └── refreshMenu()
    │
@@ -147,10 +150,17 @@ AppDelegate.applicationDidFinishLaunching
                   .machookOpenSettings                → openSettings
 ```
 
-There is no permission gate in that sequence, by design. The sweep runs
-first because a crash or force-quit between writing an envelope and the
-`defer` that deletes it leaves a payload on disk; six hours is long
-enough that no in-flight request is affected.
+There is no permission gate in that sequence, by design. Both sweeps run
+before anything starts, and for the same reason: the previous run may not
+have exited cleanly. A crash or force-quit between writing an envelope and
+the `defer` that deletes it leaves a payload on disk (six hours is long
+enough that no in-flight request is affected), and the same force-quit
+leaves `cloudflared` orphaned onto launchd, still tunnelling to the port
+this launch is about to serve.
+
+`installSignalHandlers()` is there because Hummingbird's service lifecycle
+otherwise treats `SIGTERM` as *its* shutdown signal, stopping the listener
+while the menu bar app keeps running in front of nothing.
 
 ### Which port, and who gets told
 
@@ -287,6 +297,8 @@ messages quote endpoint paths and `"\/deploy"` reads like a typo.
   "version": "0.1.0",
   "tunnel_url": "https://example.trycloudflare.com",
   "tunnel_running": true,
+  "tunnel_reachability": "reachable",
+  "tunnel_reachability_note": "",
   "local_api_port": 7876,
   "configured_api_port": 7876,
   "endpoints_total": 6,
@@ -299,6 +311,14 @@ messages quote endpoint paths and `"\/deploy"` reads like a typo.
 
 `version` comes from `CFBundleShortVersionString`, so a binary run
 straight out of `.build` (no Info.plist) reports `0.0.0`.
+
+`tunnel_running` and `tunnel_reachability` answer different questions.
+The first says the `cloudflared` child is alive; the second says the URL
+answered when we fetched it from the outside — `unknown`, `checking`,
+`reachable`, or `unreachable`, with the reason in
+`tunnel_reachability_note`. A quick tunnel can sit at `running: true` /
+`unreachable` indefinitely, which is precisely the failure this field
+exists to expose.
 
 ---
 
@@ -627,7 +647,7 @@ The same runs are recorded in `ExecutionLog` with a synthetic status code
 
 | | `.quick` (free) | `.named` (custom domain) |
 |---|---|---|
-| Arguments | `tunnel --no-autoupdate --url http://localhost:<port>` | `tunnel --no-autoupdate run --token <token>` |
+| Arguments | `tunnel --no-autoupdate --url http://localhost:<port>` | `tunnel --no-autoupdate run` (token via `TUNNEL_TOKEN`) |
 | Ingress config | The `--url` flag | The Cloudflare dashboard's Public Hostnames |
 | URL discovery | Regex `https://[a-z0-9-]+\.trycloudflare\.com` against the child's output | `https://<tunnelHostname>`, pre-populated from config |
 | Readiness signal | The URL appearing | The line `Registered tunnel connection` |
@@ -659,25 +679,96 @@ Binary lookup order:
 If none resolve, the user gets an alert with a `brew install cloudflared`
 button that copies the command.
 
-Three details that were each a bug once:
+Details that were each a bug once:
 
 - **`--no-autoupdate` must come before `run`.** It is a `tunnel`
   subcommand flag, not a `run` flag. Placed after, cloudflared rejects the
   CLI, prints help, and exits 0 within ~40 ms — a failure whose only
   visible symptom is a tunnel that never appears.
-- **Tokens are redacted in the log.** The spawn line prints
-  `<redacted-token-N-chars>` instead of the connector token, so the
-  system log never holds a credential.
+- **The connector token goes through the environment.** `TUNNEL_TOKEN`
+  rather than `--token`, because argv is world-readable via `ps` and that
+  token alone is enough to publish traffic through the user's tunnel. The
+  spawn line still redacts a `--token` value if a future flag reintroduces
+  one.
 - **`stop()` is synchronous.** SIGTERM, poll for up to 3 s, then SIGKILL
   and poll for 1 s more. It has to be, because `configChanged` calls
   `start()` immediately afterwards and a stale child would register
   against the wrong tunnel or fail to register at all.
+- **The path we launch is absolutised first.** Launching the app from a
+  shell by a relative path makes `Bundle.main` relative too, and a child
+  recorded by `ps` as `./Machook.app/…/cloudflared` will not match the
+  absolute path the stray sweep looks for.
 
 A one-shot `Resolver` box guarantees the completion handler fires exactly
 once — first URL match, or a 12 s timeout with `nil`. `TunnelStatus.shared`
-mirrors state to SwiftUI on a `@MainActor` hop; raw cloudflared output is
-logged at `debug` level so steady state stays quiet but connection
-failures are diagnosable.
+mirrors state to SwiftUI on a `@MainActor` hop.
+
+### A URL is not a working URL
+
+cloudflared reporting a healthy connection to Cloudflare's edge says
+nothing about whether the *hostname* it printed resolves. Quick tunnels
+are assigned a hostname before the DNS record is published, and sometimes
+the record never appears: cloudflared logs `Registered tunnel connection`,
+the child stays alive, and every request from the internet fails with
+`NXDOMAIN`. Reporting that URL as ready is worse than reporting nothing,
+because the URL gets pasted into a webhook provider's dashboard.
+
+So the URL is verified from the outside rather than trusted:
+
+- `beginReachabilityProbe(url:)` fetches `<url>/health` — chosen because it
+  is the one route that needs no token, so a probe cannot be confused with
+  an auth failure.
+- Retries follow Fibonacci delays `[1, 2, 3, 5, 8, 13, 21, 34]` seconds,
+  roughly 90 s in total. A quick tunnel's DNS record normally lands within
+  a few seconds; the long tail is there so a slow propagation is not
+  reported as a failure.
+- `classifyProbe(statusCode:error:)` turns the outcome into a cause the
+  user can act on: `NXDOMAIN` means the record was never published, `530`
+  means the edge has no connector (Cloudflare error 1033), `502/503/504`
+  means the tunnel works and our own listener does not, `403` means
+  Cloudflare Access is in front. It is a pure function, which is what
+  makes those mappings testable.
+- The verdict lands in `TunnelStatus.Reachability` (`unknown`, `checking`,
+  `reachable`, `unreachable(String)`) and is surfaced in the menu line, as
+  a Settings card, and as `tunnel_reachability` on `/status`. The state
+  also lives on `TunnelManager` behind a lock so `/status` can read it
+  without an actor hop, the same split already used for `publicURL`.
+- The probe is cancelled when the tunnel stops, when the child exits, and
+  when a new URL supersedes the one being checked, so a restart never
+  reports a verdict about a URL that no longer exists.
+
+### Cleaning up after ourselves
+
+Two failure modes came from the app and its child disagreeing about
+whether they were still alive:
+
+- **Signals.** Hummingbird's service lifecycle handles `SIGTERM` by
+  shutting the listener down. In a menu bar app that meant `pkill Machook`
+  left a running app with a dead port — the icon still there, every request
+  refused. `installSignalHandlers()` ignores the default disposition and
+  routes `SIGTERM`/`SIGINT` through `NSApp.terminate` instead, so the whole
+  app goes down together. `StopFlag` covers the residue: if the listener
+  stops when nobody asked it to, `ServerStatus.lastError` says so instead
+  of the app looking healthy.
+- **Orphans.** `kill -9` (or a crash) leaves `cloudflared` reparented to
+  launchd, still holding a tunnel aimed at the port the next launch will
+  serve. `reapStrayProcesses()` runs at startup and SIGTERMs them.
+
+The sweep is deliberately narrow, because the blast radius of getting it
+wrong is somebody else's production tunnel. It only runs when the
+`cloudflared` we resolved lives *inside our own bundle*, and it matches on
+that exact executable path. A dev build that fell back to
+`/opt/homebrew/bin/cloudflared` sweeps nothing at all and logs why: that
+path is shared with every other tunnel on the machine, including the
+user's own.
+
+Raw cloudflared output is logged at `debug` so steady state stays quiet,
+with one exception. `logLevel(forCloudflaredLine:)` promotes cloudflared's
+own `ERR` and `WRN` tags, phrases that only appear in failures (`failed
+to`, `cannot`, `unauthorized`, `not valid`, `rate limit`), and connection
+loss (`retrying`, `unregistered`, `connection terminated`) to `error` or
+`notice`. A default `log show` drops debug records, so the diagnostics were
+invisible in exactly the case you would go looking for them.
 
 ---
 
@@ -690,8 +781,10 @@ timer. Top to bottom:
 1. `⚠ <listener error>` — **only when the bind failed**, first, because
    no endpoint and no tunnel can work until it is fixed and the alternative
    symptom is silence.
-2. The tunnel URL (click to copy), or `Tunnel: connecting…`, or
-   `Tunnel: off (localhost:<port>)`.
+2. The tunnel URL (click to copy), qualified by what we have confirmed
+   about it: bare when reachable, `— verifying…` while the probe runs,
+   `⚠ <url> — <reason>` when it does not answer. Or `Tunnel: connecting…`,
+   or `Tunnel: off (localhost:<port>)`.
 3. `<n> endpoints, <m> MCP tools`, then up to 8 paths (command in the
    tooltip) and `… and N more`.
 4. `Recent` — the last 5 runs as `✓ /path · 200 · 41ms`, output head in
@@ -708,6 +801,12 @@ different port in Settings.` (and `errno 13` into the "use a port above
 1024" variant), naming every port that was tried. It carries the bound
 port too, which is what lets the menu and the Tunnel tab point out a
 fallback that worked but moved the address.
+
+Rebuilding on open is not enough for state that resolves on its own
+schedule: a reachability verdict can land 90 seconds after launch, when
+nobody is holding the menu open. `AppDelegate` keeps Combine subscriptions
+on `TunnelStatus.$reachability` and `ServerStatus.$lastError` and redraws
+the menu when either changes.
 
 `SettingsView` is three tabs in a fixed 680×620 window:
 

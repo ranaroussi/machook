@@ -103,7 +103,7 @@ jobs:
           for bin in \
             "Machook.app/Contents/MacOS/Machook" \
             "Machook.app/Contents/Resources/cloudflared" \
-            "Machook.app/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle"
+            "Machook.app/Contents/Frameworks/Sparkle.framework/Versions/Current/Sparkle"
           do
             if [ ! -f "$bin" ]; then
               echo "::error::missing binary: $bin"; fail=1; continue

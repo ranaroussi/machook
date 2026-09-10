@@ -148,4 +148,34 @@ final class ListenerFallbackTests: XCTestCase {
         let listening = await MainActor.run { ServerStatus.shared.isListening }
         XCTAssertFalse(listening)
     }
+
+    /// A shutdown we asked for is not news, so it must not raise an alarm in
+    /// the menu.
+    func testRequestedShutdownIsReportedQuietly() async throws {
+        // `ServerStatus.report` lands via a hop to the main actor, so another
+        // test's teardown can still be in flight. Clear it here and wait,
+        // rather than inheriting whatever the suite left behind.
+        ServerStatus.report(listening: false, port: 0)
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        LocalAPIServer.reportShutdown(port: 7876, requested: true)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let error = await MainActor.run { ServerStatus.shared.lastError }
+        XCTAssertNil(error)
+    }
+
+    /// A shutdown nobody asked for is the SIGTERM case: the service lifecycle
+    /// stops the server, the app keeps running, and the only other symptom is
+    /// a menu bar icon that answers nothing.
+    func testUnrequestedShutdownSurfacesAnError() async throws {
+        LocalAPIServer.reportShutdown(port: 7876, requested: false)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let error = await MainActor.run { ServerStatus.shared.lastError }
+        let message = try XCTUnwrap(error, "an unrequested shutdown must be visible")
+        XCTAssertTrue(message.contains("7876"), "should name the port: \(message)")
+        XCTAssertTrue(
+            message.lowercased().contains("stopped"),
+            "should say what happened: \(message)"
+        )
+    }
 }
