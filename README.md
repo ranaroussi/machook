@@ -144,6 +144,28 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 **4. Point GitHub at it**: repository → Settings → Webhooks → your tunnel URL + `/deploy`.
 
+### Something to test against first
+
+Before wiring up anything real, [`examples/log-request.sh`](examples/log-request.sh)
+gives you an endpoint that records every request it receives to
+`~/Library/Logs/machook/requests.log` and answers with a summary of what it saw:
+
+| Field | Value |
+|---|---|
+| Path | `/log` |
+| Command | `bash /path/to/machook/examples/log-request.sh {{request}}` |
+| Methods | `POST, GET` |
+
+```bash
+curl -sS -X POST 'http://127.0.0.1:7876/log?source=test' \
+  -H 'Content-Type: application/json' -d '{"event":"push"}'
+
+tail -40 ~/Library/Logs/machook/requests.log
+```
+
+Add `?fail=1` to any request to see the failure mapping (500, with stderr as the
+body). See [`examples/README.md`](examples/README.md) for the rest.
+
 ## The request envelope
 
 Everything about the request is written to a JSON file, and `{{request}}` in your command is replaced by that file's path. This is the only way request data reaches your script: nothing is interpolated into the command line, and nothing is piped to stdin.

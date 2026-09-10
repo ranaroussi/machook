@@ -55,6 +55,11 @@ to incoming webhooks.
   a note when the fallback port is in use, and a warning line when the HTTP
   listener cannot bind at all.
 - **Built-in routes**: `GET /health` (unauthenticated) and `GET /status`.
+- **Sample endpoint.** `examples/log-request.sh` records each request to
+  `~/Library/Logs/machook/requests.log` (0600, in a 0700 directory, rotated at
+  5 MiB) and answers with a JSON summary, so a new install can be exercised
+  end to end before any real command is wired up. `?fail=1` exits non-zero on
+  purpose to demonstrate the 500-plus-stderr mapping.
 - Sparkle auto-updates, Developer ID signing, and notarization in CI.
 - **Universal builds.** Releases ship one `machook-universal` artifact whose
   executable, bundled `cloudflared`, and `Sparkle.framework` each carry both
