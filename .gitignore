@@ -1,0 +1,44 @@
+# Swift / SwiftPM
+src/.build/
+.build/
+build/sparkle-keys/ed_private_key
+*.swiftmodule
+*.swiftdoc
+.swiftpm/
+Package.resolved
+
+# Xcode (we intentionally do NOT use Xcode; this just guards against accidents)
+xcuserdata/
+*.xcworkspace
+*.xcodeproj
+
+# App bundle artifacts
+*.app
+*.zip
+*.dmg
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Bundled binaries downloaded at build time
+src/Sources/Machook/Resources/cloudflared
+src/Sources/Machook/Resources/cloudflared-*
+
+# Logs
+*.log
+logs/
+
+# Editor
+.vscode/settings.json
+.idea/
+
+# Local dev
+*.local
+.env
+
+# Sparkle key material — must never be committed
+build/sparkle-keys/
+ed_private_key
+ed_public_key
