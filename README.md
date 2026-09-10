@@ -1,3 +1,5 @@
+![Machook](./assets/readme-banner.jpg)
+
 # Machook
 
 > Give any webhook a shell on your Mac. Map a URL path to a command, expose it through a **Cloudflare Tunnel**, and get the command's output back as the HTTP response. Every endpoint is simultaneously an **MCP tool**, so an AI client can call the same commands.

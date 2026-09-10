@@ -3,7 +3,7 @@
 # lowercase so tooling stays predictable.
 APP_BUNDLE := Machook.app
 
-.PHONY: build release app install run clean test info help icon
+.PHONY: build release app install run clean test info help icon icons
 
 help: ## Show this help message
 	@echo "Machook - run shell commands from incoming webhooks"
@@ -38,8 +38,8 @@ run: app ## Build and launch the app
 test: ## Run Swift unit tests
 	@cd src && swift test
 
-icon: ## Regenerate AppIcon.icns from assets/icon-app.png
-	@echo "Regenerating AppIcon.icns from source artwork..."
+icons: ## Regenerate AppIcon.icns and the menu bar glyphs from assets/
+	@echo "Regenerating AppIcon.icns from assets/icon-app.png..."
 	@SRC="assets/icon-app.png"; \
 	WORK=$$(mktemp -d)/AppIcon.iconset; \
 	mkdir -p "$$WORK"; \
@@ -48,7 +48,19 @@ icon: ## Regenerate AppIcon.icns from assets/icon-app.png
 	  sips -z $$size $$size "$$SRC" --out "$$WORK/icon_$$name.png" > /dev/null; \
 	done; \
 	iconutil -c icns "$$WORK" -o src/Sources/Machook/Resources/AppIcon.icns; \
-	echo "Wrote src/Sources/Machook/Resources/AppIcon.icns ($$(ls -la src/Sources/Machook/Resources/AppIcon.icns | awk '{print $$5}') bytes)"
+	echo "  AppIcon.icns ($$(ls -la src/Sources/Machook/Resources/AppIcon.icns | awk '{print $$5}') bytes)"
+	@echo "Regenerating menu bar glyphs from assets/icon-menubar.png..."
+	@# 18pt at 1x/2x/3x. These ship as template images: macOS keys off the
+	@# alpha channel and recolours them for light/dark menu bars, so the
+	@# source only needs a black silhouette with clean edges.
+	@for pair in "22 MenuBarIcon" "44 MenuBarIcon@2x" "66 MenuBarIcon@3x"; do \
+	  size=$${pair%% *}; name=$${pair##* }; \
+	  sips -z $$size $$size assets/icon-menubar.png \
+	    --out "src/Sources/Machook/Resources/$$name.png" > /dev/null; \
+	  echo "  $$name.png ($${size}x$${size})"; \
+	done
+
+icon: icons ## Alias for `icons`
 
 clean: ## Remove build artifacts
 	@rm -rf src/.build
