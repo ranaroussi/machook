@@ -5,5 +5,15 @@
         <link>https://raw.githubusercontent.com/ranaroussi/machook/main/appcast.xml</link>
         <description>Auto-update feed for Machook (macOS menu bar app).</description>
         <language>en</language>
+        <item>
+            <title>Version 0.1.0</title>
+            <pubDate>Thu, 10 Sep 2026 16:21:51 +0000</pubDate>
+            <link>https://github.com/ranaroussi/machook/releases/tag/v0.1.0</link>
+            <sparkle:releaseNotesLink>https://github.com/ranaroussi/machook/releases/tag/v0.1.0</sparkle:releaseNotesLink>
+            <sparkle:version>0.1.0</sparkle:version>
+            <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/ranaroussi/machook/releases/download/v0.1.0/machook-universal.zip" length="56600883" type="application/octet-stream" sparkle:edSignature="uTsUkFO361kPcPbQfC9PhrD3dhq3GZ3EDurEq3eI4fqxKQ9feQ3cODGnjwK+GJsJqdeVxSGV710egl2KXwcHCQ==" />
+        </item>
     </channel>
 </rss>
