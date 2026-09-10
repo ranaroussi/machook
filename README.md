@@ -78,7 +78,7 @@ curl -H "Authorization: Bearer <your-token>" -d '{}' https://<random>.trycloudfl
 
 ### From a release
 
-1. Download `machook-arm64.dmg` (Apple Silicon) or `machook-x86_64.dmg` (Intel) from the [releases page](https://github.com/ranaroussi/machook/releases).
+1. Download `machook-universal.dmg` from the [releases page](https://github.com/ranaroussi/machook/releases). One build runs on both Apple Silicon and Intel Macs (macOS 14+).
 2. Drag **Machook.app** to **Applications** and open it.
 3. Click the menu bar icon → **Settings…**
 

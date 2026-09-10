@@ -507,8 +507,10 @@ execute. Usually one of:
 
 - **Not executable.** `ls -l` it; the bundler `chmod +x`es its copy, a
   hand-placed one might not be.
-- **Wrong architecture.** An x86_64 binary in an arm64 bundle. Check with
-  `file`.
+- **Wrong architecture.** Released bundles ship a universal `cloudflared`
+  covering both slices, but a dev build copies whatever is on your `PATH`,
+  which may be thin. Check with `lipo -archs` — if it lacks your Mac's
+  architecture, rebuild with `make app` to fetch a merged copy.
 - **Blocked by Gatekeeper.** A dev bundle copies whatever `cloudflared`
   is on your `PATH` into `Contents/Resources` and signs it with the same
   identity as the app; if you replaced that file *after* signing, the

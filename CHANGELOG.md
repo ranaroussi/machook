@@ -56,6 +56,14 @@ to incoming webhooks.
   listener cannot bind at all.
 - **Built-in routes**: `GET /health` (unauthenticated) and `GET /status`.
 - Sparkle auto-updates, Developer ID signing, and notarization in CI.
+- **Universal builds.** Releases ship one `machook-universal` artifact whose
+  executable, bundled `cloudflared`, and `Sparkle.framework` each carry both
+  `arm64` and `x86_64`. A Sparkle appcast channel advertises a single
+  `<enclosure>` with no architecture filtering, so a per-arch release would
+  offer half the user base a build their Mac cannot launch; CI now fails if any
+  shipped binary is missing a slice. The appcast's `minimumSystemVersion` is
+  read from `LSMinimumSystemVersion` rather than hardcoded, so an update is
+  never offered to a macOS version the app cannot run on.
 - 44 unit tests covering shell quoting, template rendering, path and tool-name
   normalization, endpoint validation, configuration decoding, envelope shape and
   file permissions, port-candidate selection, the port fallback against a real

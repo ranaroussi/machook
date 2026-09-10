@@ -83,7 +83,9 @@ git push origin v0.2.0
 
 That's it. The workflow at `.github/workflows/release.yml` then:
 
-1. Builds the arm64 + x86_64 `.app` bundles (matrix job).
+1. Builds a single universal `.app` bundle: the Swift executable is compiled for
+   `arm64` and `x86_64` and merged with `lipo`, as is the bundled `cloudflared`.
+   A verification step fails the release if any shipped binary is missing a slice.
 2. Imports the Developer ID cert.
 3. Injects `SPARKLE_ED_PUBLIC_KEY` into `Info.plist` and `CFBundleShortVersionString` from the tag.
 4. Code-signs the bundle (Sparkle XPC services, cloudflared, the main binary, the outer `.app`).
@@ -113,8 +115,7 @@ After publishing, before you tell anyone, smoke-test the released artifact yours
 
 ```bash
 # Pull the artifact from the release page
-ARCH=arm64       # or x86_64
-ZIP_URL="https://github.com/ranaroussi/machook/releases/download/v0.2.0/machook-${ARCH}.zip"
+ZIP_URL="https://github.com/ranaroussi/machook/releases/download/v0.2.0/machook-universal.zip"
 curl -fL "$ZIP_URL" -o /tmp/machook.zip
 curl -fL "$ZIP_URL.sha256" -o /tmp/machook.zip.sha256
 
@@ -126,7 +127,22 @@ unzip -q machook.zip
 codesign --verify --deep --strict --verbose=2 "Machook.app"
 spctl -a -vvv -t install "Machook.app"
 # Expected: accepted, source=Notarized Developer ID
+
+# Confirm both slices survived signing and notarization
+lipo -archs "Machook.app/Contents/MacOS/Machook"              # arm64 x86_64
+lipo -archs "Machook.app/Contents/Resources/cloudflared"      # arm64 x86_64
 ```
+
+On an Apple Silicon Mac you can smoke-test the Intel half without an Intel Mac,
+because Rosetta translates in that direction:
+
+```bash
+arch -x86_64 "Machook.app/Contents/MacOS/Machook"
+curl -s http://127.0.0.1:7876/health    # {"ok":true}
+```
+
+A thin arm64 build fails that command with `Bad CPU type in executable` — which
+is exactly what an Intel user would have seen.
 
 If Gatekeeper says `rejected`, the notarization step probably timed out — check the workflow run logs and re-run that job.
 

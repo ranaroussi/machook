@@ -11,21 +11,16 @@ permissions:
 
 jobs:
   build:
-    name: Build (${{ matrix.arch }})
-    # macos-15 ships Xcode 16.4 (Swift 6.1) by default — needed for
-    # SQLite.swift >= 0.15.5 which uses swift-tools-version: 6.1.0.
-    # macos-14 only has up to Xcode 16.2 (Swift 6.0) and is being
-    # deprecated in late 2026 anyway, so we may as well jump now.
+    name: Build (universal)
+    # macos-15 ships Xcode 16.4 (Swift 6.1) by default. macos-14 only has up
+    # to Xcode 16.2 (Swift 6.0) and is being deprecated in late 2026 anyway,
+    # so we may as well jump now.
+    #
+    # One job, not an arch matrix: create-app-bundle.sh cross-compiles both
+    # slices and lipos them into a single universal bundle. Sparkle's appcast
+    # has no architecture filtering, so shipping one artifact is the only way
+    # both Apple Silicon and Intel users can auto-update from one <enclosure>.
     runs-on: macos-15
-    strategy:
-      matrix:
-        include:
-          - arch: arm64
-            swift_arch: arm64
-            cloudflared_asset: cloudflared-darwin-arm64.tgz
-          - arch: x86_64
-            swift_arch: x86_64
-            cloudflared_asset: cloudflared-darwin-amd64.tgz
 
     steps:
       - name: Checkout
@@ -83,42 +78,48 @@ jobs:
           echo "version=$VERSION"             >> "$GITHUB_OUTPUT"
           echo "build_number=$BUILD_NUMBER"   >> "$GITHUB_OUTPUT"
 
-      - name: Download cloudflared
-        run: |
-          # Cloudflare ships macOS cloudflared as a .tgz archive
-          # containing a single `cloudflared` binary at the root.
-          # The bare-binary asset they used to publish at
-          # `cloudflared-darwin-{arm64,amd64}` no longer exists —
-          # downloading it 404s.
-          mkdir -p src/Sources/Resources
-          tmp="$(mktemp -d)"
-          curl -fSL --retry 3 --retry-delay 5 \
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/${{ matrix.cloudflared_asset }}" \
-            -o "$tmp/cloudflared.tgz"
-          tar -xzf "$tmp/cloudflared.tgz" -C "$tmp"
-          # Locate the extracted binary (top-level filename varies between
-          # `cloudflared` and `cloudflared-darwin-<arch>` across releases).
-          extracted="$(find "$tmp" -maxdepth 2 -type f -name 'cloudflared*' ! -name '*.tgz' | head -n1)"
-          if [ -z "$extracted" ]; then
-            echo "::error::Couldn't find cloudflared binary inside $tmp after extraction"
-            ls -la "$tmp"
-            exit 1
-          fi
-          cp "$extracted" src/Sources/Resources/cloudflared
-          chmod +x src/Sources/Resources/cloudflared
-          rm -rf "$tmp"
-          file src/Sources/Resources/cloudflared
-          src/Sources/Resources/cloudflared --version
+      # cloudflared is fetched by create-app-bundle.sh, which downloads both
+      # macOS slices and lipos them. Doing it there rather than here keeps one
+      # implementation for CI and local builds — the previous split had CI
+      # writing to a path the bundler no longer reads, so the bundler silently
+      # fell through to a download URL Cloudflare had already withdrawn.
 
-      - name: Build .app bundle
+      - name: Build universal .app bundle
         env:
           CODESIGN_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
           APP_VERSION: ${{ steps.version.outputs.version }}
-          TARGET_ARCH: ${{ matrix.swift_arch }}
+          TARGET_ARCH: universal
           SPARKLE_ED_PUBLIC_KEY: ${{ secrets.SPARKLE_ED_PUBLIC_KEY }}
         run: |
           chmod +x create-app-bundle.sh
           ./create-app-bundle.sh
+
+      - name: Verify universal slices
+        # create-app-bundle.sh already fails on a thin binary; this repeats the
+        # check as a release gate so a regression in the bundler can't quietly
+        # ship a half-architecture build.
+        run: |
+          fail=0
+          for bin in \
+            "Machook.app/Contents/MacOS/Machook" \
+            "Machook.app/Contents/Resources/cloudflared" \
+            "Machook.app/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle"
+          do
+            if [ ! -f "$bin" ]; then
+              echo "::error::missing binary: $bin"; fail=1; continue
+            fi
+            archs="$(lipo -archs "$bin" 2>/dev/null || echo unknown)"
+            echo "$bin → $archs"
+            case "$archs" in
+              *arm64*) ;;
+              *) echo "::error::$bin is missing the arm64 slice ($archs)"; fail=1 ;;
+            esac
+            case "$archs" in
+              *x86_64*) ;;
+              *) echo "::error::$bin is missing the x86_64 slice ($archs)"; fail=1 ;;
+            esac
+          done
+          exit $fail
 
       - name: Verify code signature (best effort)
         run: |
@@ -143,9 +144,11 @@ jobs:
           rm machook-notarize.zip
 
       - name: Package ZIP
+        # This ZIP is both the download link and the Sparkle enclosure, so its
+        # name is referenced by the appcast job below.
         run: |
-          ditto -c -k --sequesterRsrc --keepParent "Machook.app" "machook-${{ matrix.arch }}.zip"
-          shasum -a 256 "machook-${{ matrix.arch }}.zip" > "machook-${{ matrix.arch }}.zip.sha256"
+          ditto -c -k --sequesterRsrc --keepParent "Machook.app" "machook-universal.zip"
+          shasum -a 256 "machook-universal.zip" > "machook-universal.zip.sha256"
 
       - name: Package DMG
         run: |
@@ -158,21 +161,21 @@ jobs:
             --icon "Machook.app" 175 120 \
             --hide-extension "Machook.app" \
             --app-drop-link 425 120 \
-            "machook-${{ matrix.arch }}.dmg" \
+            "machook-universal.dmg" \
             "Machook.app" || true
-          if [ -f "machook-${{ matrix.arch }}.dmg" ]; then
-            shasum -a 256 "machook-${{ matrix.arch }}.dmg" > "machook-${{ matrix.arch }}.dmg.sha256"
+          if [ -f "machook-universal.dmg" ]; then
+            shasum -a 256 "machook-universal.dmg" > "machook-universal.dmg.sha256"
           fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: machook-${{ matrix.arch }}
+          name: machook-universal
           path: |
-            machook-${{ matrix.arch }}.zip
-            machook-${{ matrix.arch }}.zip.sha256
-            machook-${{ matrix.arch }}.dmg
-            machook-${{ matrix.arch }}.dmg.sha256
+            machook-universal.zip
+            machook-universal.zip.sha256
+            machook-universal.dmg
+            machook-universal.dmg.sha256
           retention-days: 7
 
   release:
@@ -209,14 +212,16 @@ jobs:
 
             ### Downloads
 
-            | Architecture | DMG | ZIP |
-            |--------------|-----|-----|
-            | Apple Silicon (M1/M2/M3/M4) | `machook-arm64.dmg` | `machook-arm64.zip` |
-            | Intel (x86_64)              | `machook-x86_64.dmg` | `machook-x86_64.zip` |
+            One universal build runs on both Apple Silicon and Intel Macs. Requires macOS 14 or later.
+
+            | Download | Contents |
+            |----------|----------|
+            | `machook-universal.dmg` | Drag-to-Applications installer |
+            | `machook-universal.zip` | Same app, zipped (also what auto-update fetches) |
 
             ### Install
 
-            1. Download the right file for your Mac.
+            1. Download either file — there's only one build, no architecture to pick.
             2. Mount the DMG (or unzip) and drag **Machook.app** to **Applications**.
             3. Open Settings from the menu bar icon, set a bearer token, and add your endpoints.
             4. Turn on the tunnel and point your webhook sender at the printed URL.
@@ -226,7 +231,7 @@ jobs:
             ### Verification
 
             ```bash
-            shasum -a 256 -c machook-arm64.zip.sha256
+            shasum -a 256 -c machook-universal.zip.sha256
             ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -281,28 +286,28 @@ jobs:
           cd src && swift build -c release --product Machook
           # The build produces Sparkle's bundle with sign_update inside.
 
-      - name: Append both arches to appcast.xml
+      - name: Append release to appcast.xml
         run: |
-          ARM_ZIP="$(find artifacts -name 'machook-arm64.zip' | head -1)"
-          INTEL_ZIP="$(find artifacts -name 'machook-x86_64.zip' | head -1)"
+          # Sparkle's <enclosure> is one-per-channel with no architecture
+          # filtering, which is exactly why the build job ships a single
+          # universal ZIP: this one URL is correct for every Mac that can run
+          # the app. The signature is computed over that same ZIP, so the file
+          # Sparkle downloads is byte-identical to the one published here.
+          ZIP="$(find artifacts -name 'machook-universal.zip' | head -1)"
+          if [ -z "$ZIP" ]; then
+            echo "::error::machook-universal.zip not found in artifacts — nothing to sign."
+            find artifacts -type f | head -20
+            exit 1
+          fi
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
           NOTES_URL="https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
 
-          if [ -n "$ARM_ZIP" ]; then
-            ./scripts/appcast-add.sh \
-              --zip "$ARM_ZIP" \
-              --version "${{ steps.meta.outputs.version }}" \
-              --build "${{ steps.meta.outputs.build_number }}" \
-              --download-url "$BASE_URL/machook-arm64.zip" \
-              --notes-url "$NOTES_URL"
-          fi
-
-          # NOTE: Sparkle's <item> is one-per-channel, not one-per-arch.
-          # We only push the ARM64 entry — Intel users get the universal
-          # binary via the same enclosure URL (Sparkle picks the
-          # matching slice). If we ever ship truly arch-specific
-          # binaries we'd publish two channels with sparkle:channel
-          # filters; not needed at v0.
+          ./scripts/appcast-add.sh \
+            --zip "$ZIP" \
+            --version "${{ steps.meta.outputs.version }}" \
+            --build "${{ steps.meta.outputs.build_number }}" \
+            --download-url "$BASE_URL/machook-universal.zip" \
+            --notes-url "$NOTES_URL"
 
       - name: Commit + push appcast.xml
         run: |

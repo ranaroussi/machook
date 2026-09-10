@@ -799,25 +799,36 @@ Version numbers are derived, not hand-edited: `CFBundleShortVersionString`
 from `$APP_VERSION` or `git describe --tags --abbrev=0`,
 `CFBundleVersion` from `git rev-list --count HEAD`.
 
-Make targets: `build`, `release`, `app`, `install`, `run`, `test`,
-`icon`, `clean`, `info`.
+Make targets: `build`, `release`, `app` (native arch, fast),
+`app-universal` (the release shape), `install`, `run`, `test`, `icons`,
+`clean`, `info`.
 
 ### Release
 
 `.github/workflows/release.yml` fires on a `v*` tag (or manual dispatch)
-and, per architecture (`arm64`, `x86_64`):
+and produces **one universal artifact**, not one per architecture:
 
 1. Select an Xcode with a Swift 6 toolchain, import the Developer ID cert.
-2. Download the matching `cloudflared` release tarball for bundling.
-3. `./create-app-bundle.sh` with `CODESIGN_IDENTITY`, `APP_VERSION`,
-   `TARGET_ARCH`, `SPARKLE_ED_PUBLIC_KEY`.
+2. `./create-app-bundle.sh` with `CODESIGN_IDENTITY`, `APP_VERSION`,
+   `TARGET_ARCH=universal`, `SPARKLE_ED_PUBLIC_KEY`. It builds the Swift
+   executable once per arch, `lipo`s the results, and merges both
+   `cloudflared` slices the same way.
+3. Fail the job unless `Machook`, `cloudflared`, and `Sparkle` each report
+   both `arm64` and `x86_64` under `lipo -archs`.
 4. Notarize with `notarytool submit --wait`, then `stapler staple` +
    `stapler validate`.
-5. Package `machook-<arch>.zip` (via `ditto -c -k --sequesterRsrc
-   --keepParent`) and `machook-<arch>.dmg`, each with a `.sha256`.
+5. Package `machook-universal.zip` (via `ditto -c -k --sequesterRsrc
+   --keepParent`) and `machook-universal.dmg`, each with a `.sha256`.
 6. Create the GitHub release, then update `appcast.xml` via
-   `scripts/appcast-add.sh`, which signs each ZIP with the Sparkle EdDSA
+   `scripts/appcast-add.sh`, which signs that ZIP with the Sparkle EdDSA
    private key and appends an `<item>` pointing at the release asset.
+
+Why universal rather than a build matrix: a Sparkle appcast channel carries
+a single `<enclosure>` with no architecture filtering, so a per-arch release
+has to pick one URL to advertise — and whichever it picks, the other half of
+the user base is offered a build their Mac cannot execute. Rosetta does not
+cover the gap, since it translates x86_64 on Apple Silicon and never the
+reverse. One fat binary makes the single enclosure correct for everyone.
 
 Sparkle itself is wired through `Info.plist` (`SUFeedURL`,
 `SUScheduledCheckInterval` 86400, `SUEnableAutomaticChecks` true,

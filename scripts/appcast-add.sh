@@ -9,11 +9,10 @@
 #
 # Usage:
 #   scripts/appcast-add.sh \
-#     --zip machook-arm64.zip \
+#     --zip machook-universal.zip \
 #     --version 0.1.0 \
 #     --build 42 \
-#     --download-url https://github.com/ranaroussi/machook/releases/download/v0.1.0/machook-arm64.zip \
-#     --min-system 13.0 \
+#     --download-url https://github.com/ranaroussi/machook/releases/download/v0.1.0/machook-universal.zip \
 #     --notes-url https://github.com/ranaroussi/machook/releases/tag/v0.1.0
 #
 # Reads the EdDSA private key from $SPARKLE_ED_PRIVATE_KEY (env), or
@@ -28,7 +27,12 @@ zip_path=""
 version=""
 build_number=""
 download_url=""
-min_system="13.0"
+# Sparkle refuses to offer an update to a Mac below this version, which is the
+# only thing standing between a macOS 13 user and a download that cannot
+# launch. Derive it from the app itself rather than repeating a literal here:
+# a hardcoded default silently goes stale the moment the deployment target
+# moves, and it was already one major version too low.
+min_system="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$PROJECT_DIR/src/Info.plist" 2>/dev/null || echo '14.0')"
 notes_url=""
 private_key_path=""
 

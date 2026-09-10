@@ -21,9 +21,14 @@ release: ## Build the Swift executable (release)
 	@cd src && swift build -c release
 	@echo "Built: src/.build/release/Machook"
 
-app: ## Build the .app bundle (release)
-	@echo "Building app bundle..."
-	@./create-app-bundle.sh
+app: ## Build the .app bundle for this Mac's architecture (fast)
+	@echo "Building app bundle ($(shell uname -m))..."
+	@TARGET_ARCH="$(shell uname -m)" ./create-app-bundle.sh
+	@echo "App bundle ready: $(APP_BUNDLE)"
+
+app-universal: ## Build the .app bundle exactly as releases do (arm64 + x86_64)
+	@echo "Building universal app bundle..."
+	@TARGET_ARCH=universal ./create-app-bundle.sh
 	@echo "App bundle ready: $(APP_BUNDLE)"
 
 install: app ## Install the .app to /Applications
