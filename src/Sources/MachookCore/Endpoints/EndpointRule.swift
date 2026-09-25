@@ -25,6 +25,11 @@ public struct EndpointRule: Codable, Equatable, Sendable, Identifiable {
     /// SIGKILL two seconds later, and the caller sees 504.
     public var timeoutSeconds: Int
 
+    /// When true, the HTTP caller gets 201 immediately and the command
+    /// keeps running in the background. The result is written to the
+    /// persistent execution log when it finishes.
+    public var async: Bool
+
     /// Working directory for the command. Empty means the user's home.
     public var workingDirectory: String
 
@@ -65,6 +70,7 @@ public struct EndpointRule: Codable, Equatable, Sendable, Identifiable {
         methods: [String] = EndpointRule.defaultMethods,
         enabled: Bool = true,
         timeoutSeconds: Int = 30,
+        async: Bool = false,
         workingDirectory: String = "",
         toolDescription: String = "",
         mcpEnabled: Bool = true,
@@ -78,6 +84,7 @@ public struct EndpointRule: Codable, Equatable, Sendable, Identifiable {
         self.methods = methods
         self.enabled = enabled
         self.timeoutSeconds = timeoutSeconds
+        self.async = async
         self.workingDirectory = workingDirectory
         self.toolDescription = toolDescription
         self.mcpEnabled = mcpEnabled
@@ -95,6 +102,7 @@ public struct EndpointRule: Codable, Equatable, Sendable, Identifiable {
         self.methods          = (try? c.decode([String].self, forKey: .methods))          ?? d.methods
         self.enabled          = (try? c.decode(Bool.self,     forKey: .enabled))          ?? d.enabled
         self.timeoutSeconds   = (try? c.decode(Int.self,      forKey: .timeoutSeconds))   ?? d.timeoutSeconds
+        self.async            = (try? c.decode(Bool.self,     forKey: .async))            ?? d.async
         self.workingDirectory = (try? c.decode(String.self,   forKey: .workingDirectory)) ?? d.workingDirectory
         self.toolDescription  = (try? c.decode(String.self,   forKey: .toolDescription))  ?? d.toolDescription
         self.mcpEnabled       = (try? c.decode(Bool.self,     forKey: .mcpEnabled))       ?? d.mcpEnabled

@@ -363,9 +363,14 @@ Exit code 15 is `SIGTERM`. At the deadline the child gets SIGTERM, then
 SIGKILL two seconds later if it ignored it.
 
 - **Raise the limit** per endpoint: editor → Timeout (1–3600 seconds).
-- **Or make the endpoint asynchronous.** A webhook provider gives you
-  seconds, not minutes. Have the command hand the envelope to a
-  background job and exit immediately:
+- **Or make the endpoint asynchronous.** Turn on **Async** in the
+  endpoint editor. The HTTP caller gets **201 Created** immediately,
+  the command keeps running in the background, and the result is
+  written to `~/Library/Logs/machook/executions.jsonl` when it finishes.
+  Async endpoints still respect Timeout and Max concurrent commands;
+  they just don't make the caller wait.
+- **Or do it yourself** if you need custom orchestration: have the
+  command hand the envelope to a background job and exit immediately:
   `cp "$1" ~/queue/ && echo '{"accepted":true}'`. That also frees the
   concurrency slot.
 
@@ -885,6 +890,7 @@ Two more gotchas:
 | Settings | `UserDefaults` domain `com.machook.app`, key `machook.config.v1` (a JSON blob) — `~/Library/Preferences/com.machook.app.plist` |
 | Request envelopes | `$TMPDIR/machook/requests/` (`getconf DARWIN_USER_TEMP_DIR`), mode `0700`, files `0600`, deleted after each run |
 | Recent runs | Memory only, last 100, cleared on relaunch |
+| Execution log | `~/Library/Logs/machook/executions.jsonl` — persistent JSON-lines record of every run, including async completions |
 | App bundle | `/Applications/Machook.app`, or `./Machook.app` for a dev build |
 | Bundled cloudflared | `Machook.app/Contents/Resources/cloudflared` (release builds) |
 | Login item | Registered via `SMAppService`; System Settings → General → Login Items |

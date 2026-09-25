@@ -87,7 +87,7 @@ struct EndpointEditorView: View {
                         .controlSize(.small)
                 }
             }
-            field("Timeout", help: "The command gets SIGTERM at this point, SIGKILL two seconds later.") {
+            field("Timeout", help: "The command gets SIGTERM at this point, SIGKILL two seconds later. Ignored for async endpoints — they still run under this limit, but the caller does not wait.") {
                 HStack(spacing: 6) {
                     TextField("", value: $draft.timeoutSeconds, format: .number.grouping(.never))
                         .textFieldStyle(.roundedBorder)
@@ -96,6 +96,11 @@ struct EndpointEditorView: View {
                     Text("seconds").foregroundStyle(.secondary)
                     Spacer()
                 }
+            }
+            field("Async", help: "Return 201 Accepted immediately and let the command finish in the background. The result is written to the execution log.") {
+                Toggle("", isOn: $draft.async)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
             }
         }
     }

@@ -215,6 +215,21 @@ final class AppConfigTests: XCTestCase {
         XCTAssertTrue(decoded.endpoints[0].enabled)
     }
 
+    func testAsyncFieldEncodesAndDecodes() throws {
+        let rule = EndpointRule(path: "/async", command: "true", async: true)
+        let data = try JSONEncoder().encode(rule)
+        let decoded = try JSONDecoder().decode(EndpointRule.self, from: data)
+        XCTAssertTrue(decoded.async)
+    }
+
+    func testAsyncDefaultsToFalseWhenMissing() throws {
+        let json = """
+        {"id":"\(UUID().uuidString)","path":"/x","command":"true"}
+        """
+        let decoded = try JSONDecoder().decode(EndpointRule.self, from: Data(json.utf8))
+        XCTAssertFalse(decoded.async)
+    }
+
     func testDefaultPortsAreThePrimaryThenTheFallback() {
         XCTAssertEqual(AppConfig.default.listenPortCandidates(), [7876, 7877])
     }

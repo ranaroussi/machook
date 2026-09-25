@@ -267,9 +267,58 @@ public final class LocalAPIServer: @unchecked Sendable {
             body: body
         )
 
+        // Async endpoints return 201 immediately and let the command run
+        // in the background. The result is logged when it finishes.
+        if rule.async {
+            do {
+                let runID = try await CommandRunner.shared.runAsync(
+                    rule: rule,
+                    envelope: envelope,
+                    config: config,
+                    source: "http"
+                )
+                Log.api.info("\(path, privacy: .public) → 201 accepted, run \(runID, privacy: .public)")
+                ExecutionLog.post(
+                    id: envelope.id,
+                    source: "http",
+                    label: path,
+                    statusCode: Int(HTTPResponse.Status.created.code),
+                    exitCode: -1,
+                    durationMs: 0,
+                    output: "Accepted run \(runID)",
+                    async: true
+                )
+                return acceptedResponse(runID: runID)
+            } catch let error as CommandRunError {
+                let status: HTTPResponse.Status
+                switch error {
+                case .atCapacity:         status = .serviceUnavailable
+                case .badTemplate:        status = .internalServerError
+                case .envelopeWriteFailed: status = .internalServerError
+                case .spawnFailed:        status = .internalServerError
+                }
+                let message = error.errorDescription ?? "Command failed to run"
+                Log.api.error("\(path, privacy: .public): \(message, privacy: .public)")
+                ExecutionLog.post(
+                    id: envelope.id,
+                    source: "http",
+                    label: path,
+                    statusCode: Int(status.code),
+                    exitCode: -1,
+                    durationMs: 0,
+                    output: message
+                )
+                return problem(status, message)
+            } catch {
+                let message = error.localizedDescription
+                Log.api.error("\(path, privacy: .public): \(message, privacy: .public)")
+                return problem(.internalServerError, message)
+            }
+        }
+
         do {
             let result = try await CommandRunner.shared.run(rule: rule, envelope: envelope, config: config)
-            return response(for: result, label: path, source: "http")
+            return response(for: result, label: path, source: "http", runID: envelope.id)
         } catch let error as CommandRunError {
             let status: HTTPResponse.Status
             switch error {
@@ -281,6 +330,7 @@ public final class LocalAPIServer: @unchecked Sendable {
             let message = error.errorDescription ?? "Command failed to run"
             Log.api.error("\(path, privacy: .public): \(message, privacy: .public)")
             ExecutionLog.post(
+                id: envelope.id,
                 source: "http",
                 label: path,
                 statusCode: Int(status.code),
@@ -301,7 +351,7 @@ public final class LocalAPIServer: @unchecked Sendable {
     /// stdout is the response body on success. When a command succeeds
     /// silently (`say hi` prints nothing) an empty 200 tells the caller
     /// very little, so we substitute a small JSON summary.
-    static func response(for result: CommandResult, label: String, source: String) -> Response {
+    static func response(for result: CommandResult, label: String, source: String, runID: String) -> Response {
         let status: HTTPResponse.Status
         var payload: Data
         var contentType: String
@@ -337,12 +387,18 @@ public final class LocalAPIServer: @unchecked Sendable {
 
         Log.api.info("\(label, privacy: .public) → \(status.code, privacy: .public) in \(result.durationMs, privacy: .public)ms")
         ExecutionLog.post(
+            id: runID,
             source: source,
             label: label,
             statusCode: Int(status.code),
             exitCode: result.exitCode,
             durationMs: result.durationMs,
-            output: result.stdoutText.isEmpty ? result.stderrText : result.stdoutText
+            output: result.stdoutText,
+            stderr: result.stderrText,
+            async: false,
+            timedOut: result.timedOut,
+            stdoutTruncated: result.stdoutTruncated,
+            stderrTruncated: result.stderrTruncated
         )
 
         var response = Response(status: status, body: .init(byteBuffer: ByteBuffer(data: payload)))
@@ -352,6 +408,21 @@ public final class LocalAPIServer: @unchecked Sendable {
         if result.stdoutTruncated || result.stderrTruncated {
             setHeader(&response, "X-Machook-Truncated", "true")
         }
+        return response
+    }
+
+    /// 201 Created for async endpoints.
+    static func acceptedResponse(runID: String) -> Response {
+        let payload = (try? JSONSerialization.data(withJSONObject: [
+            "accepted": true,
+            "run_id": runID
+        ], options: [.withoutEscapingSlashes])) ?? Data("{\"accepted\":true}".utf8)
+        var response = Response(
+            status: .created,
+            body: .init(byteBuffer: ByteBuffer(data: payload))
+        )
+        response.headers[.contentType] = "application/json"
+        setHeader(&response, "X-Machook-Run-Id", runID)
         return response
     }
 

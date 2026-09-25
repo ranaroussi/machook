@@ -93,6 +93,7 @@ these six endpoints.
 | `/quiet` | `true` | POST | 30 | yes | Empty stdout → synthetic JSON |
 | `/boom` | `echo bad >&2; exit 7` | POST | 30 | yes | Non-zero exit → 500 |
 | `/slow` | `sleep 5` | POST | 1 | yes | Timeout → 504 |
+| `/async` | `sleep 2; echo done` | POST | 30 | yes | Async → 201, then log |
 | `/off` | `echo nope` | POST | 30 | **no** | Disabled → 503 |
 
 ### Option A — the GUI
@@ -157,6 +158,7 @@ config = {
         ep("/quiet", "true"),
         ep("/boom",  "echo bad >&2; exit 7"),
         ep("/slow",  "sleep 5", timeout=1),
+        ep("/async", "sleep 2; echo done", async=True),
         ep("/off",   "echo nope", enabled=False),
     ],
 }
@@ -270,6 +272,16 @@ time curl -sS -w '\n%{http_code}\n' "${AUTH[@]}" -d '{}' "$BASE/slow"
 # {"error":"Command timed out after 1022 ms","exit_code":15,...}
 # 504
 # (~1s, not ~5s)
+
+# Async — 201 immediately, command finishes in the background
+curl -sS -i "${AUTH[@]}" -d '{}' "$BASE/async" | head -10
+# HTTP/1.1 201 Created
+# X-Machook-Run-Id: ...
+# {"accepted":true,"run_id":"..."}
+# Wait for it, then confirm the log:
+sleep 3
+tail -1 ~/Library/Logs/machook/executions.jsonl | jq '{statusCode, exitCode, stdout, async}'
+# { "statusCode": 200, "exitCode": 0, "stdout": "done\n", "async": true }
 
 # Unknown path — note this needs a VALID token; auth runs before routing
 curl -sS -w '\n%{http_code}\n' "${AUTH[@]}" -d '{}' "$BASE/nope"

@@ -20,11 +20,14 @@ whether it is a webhook POST or an MCP `tools/call`.
 
 | Surface | Where it enters | What it ends up doing |
 |---------|-----------------|-----------------------|
-| Webhook / plain HTTP | `POST https://<tunnel>/deploy` | `LocalAPIServer.dispatch` → `CommandRunner.run` |
-| MCP tool call | `POST https://<tunnel>/mcp` (`tools/call`) | `MCPService.call` → `CommandRunner.run` |
+| Webhook / plain HTTP | `POST https://<tunnel>/deploy` | `LocalAPIServer.dispatch` → `CommandRunner.run` (or `runAsync` for async endpoints) |
+| MCP tool call | `POST https://<tunnel>/mcp` (`tools/call`) | `MCPService.call` → `CommandRunner.run` (or `runAsync` for async endpoints) |
 | Settings "Test" button | `EndpointEditorView.runTest()` | `CommandRunner.run` on the unsaved draft |
 
-All three converge on a single `CommandRunner.run(rule:envelope:config:)`.
+All three converge on `CommandRunner.run(rule:envelope:config:)` or its
+fire-and-forget counterpart `runAsync`. Both enforce the same timeout,
+output cap, and concurrency budget, and both write their final result
+to the persistent `ExecutionLogStore`.
 There is exactly one place a command can be spawned, which is also the
 only place the timeout, the output cap, and the concurrency budget are
 enforced.
@@ -56,12 +59,13 @@ src/
 │       │   ├── LocalAPIServer.swift   # Hummingbird routes, dispatch, auth, response mapping
 │       │   └── ServerStatus.swift     # Observable listener state incl. bind failures
 │       ├── Endpoints/
-│       │   ├── EndpointRule.swift     # One endpoint: path, command, validation, tool name
-│       │   ├── ShellQuote.swift       # The security boundary
-│       │   ├── CommandTemplate.swift  # {{request}} substitution
-│       │   ├── RequestEnvelope.swift  # The JSON envelope + staging directory
-│       │   ├── CommandRunner.swift    # Spawn, drain, timeout, cap, concurrency
-│       │   └── ExecutionLog.swift     # In-memory ring buffer of recent runs
+│       │   ├── EndpointRule.swift       # One endpoint: path, command, validation, tool name, async flag
+│       │   ├── ShellQuote.swift         # The security boundary
+│       │   ├── CommandTemplate.swift    # {{request}} substitution
+│       │   ├── RequestEnvelope.swift    # The JSON envelope + staging directory
+│       │   ├── CommandRunner.swift      # Spawn, drain, timeout, cap, concurrency, async
+│       │   ├── ExecutionLog.swift       # In-memory ring buffer of recent runs
+│       │   └── ExecutionLogStore.swift  # Persistent JSON-lines execution log
 │       ├── MCP/
 │       │   └── MCPService.swift       # Tool catalog + tools/call
 │       ├── Settings/
@@ -545,11 +549,14 @@ isolation boundary.
 
 `ExecutionLog` is a `@MainActor` ring buffer of the last 100 runs
 (source, label, status code, exit code, duration, first line of output
-truncated to 120 chars). Both surfaces post to it. It is deliberately
-**not** persisted: unlike the outbound relay this app replaced, there is
-nothing to retry and nothing to reconcile after a crash, so a SQLite
-table would be storage for its own sake. The menu bar shows the last 5,
-the Settings General tab the last 12.
+truncated to 120 chars). Both surfaces post to it. It is backed by
+`ExecutionLogStore`, which appends every run to
+`~/Library/Logs/machook/executions.jsonl` as a JSON line. The persistent
+store matters for async runs: the HTTP response returns before the
+command finishes, so the only place to see the eventual outcome is the
+log. The ring buffer is hydrated from the store on init, so recent
+history survives relaunch. The menu bar shows the last 5, the Settings
+General tab the last 12.
 
 ---
 

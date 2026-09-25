@@ -145,15 +145,45 @@ public final class MCPService {
         )
 
         do {
+            if rule.async {
+                let runID = try await CommandRunner.shared.runAsync(
+                    rule: rule,
+                    envelope: envelope,
+                    config: config,
+                    source: "mcp"
+                )
+                Log.mcp.info("tool \(match.toolName, privacy: .public) → accepted async run \(runID, privacy: .public)")
+                ExecutionLog.post(
+                    id: runID,
+                    source: "mcp",
+                    label: match.toolName,
+                    statusCode: 201,
+                    exitCode: -1,
+                    durationMs: 0,
+                    output: "Accepted async run \(runID)",
+                    async: true
+                )
+                return .init(
+                    content: [.text(text: "Accepted run \(runID). The command is running in the background.", annotations: nil, _meta: nil)],
+                    isError: false
+                )
+            }
+
             let result = try await CommandRunner.shared.run(rule: rule, envelope: envelope, config: config)
             let statusCode = result.succeeded ? 200 : (result.timedOut ? 504 : 500)
             ExecutionLog.post(
+                id: envelope.id,
                 source: "mcp",
                 label: match.toolName,
                 statusCode: statusCode,
                 exitCode: result.exitCode,
                 durationMs: result.durationMs,
-                output: result.stdoutText.isEmpty ? result.stderrText : result.stdoutText
+                output: result.stdoutText,
+                stderr: result.stderrText,
+                async: false,
+                timedOut: result.timedOut,
+                stdoutTruncated: result.stdoutTruncated,
+                stderrTruncated: result.stderrTruncated
             )
             Log.mcp.info("tool \(match.toolName, privacy: .public) → \(statusCode, privacy: .public) in \(result.durationMs, privacy: .public)ms")
 
@@ -172,6 +202,7 @@ public final class MCPService {
             let message = runError.errorDescription ?? "Command failed to run"
             Log.mcp.error("tool \(match.toolName, privacy: .public): \(message, privacy: .public)")
             ExecutionLog.post(
+                id: envelope.id,
                 source: "mcp",
                 label: match.toolName,
                 statusCode: 500,

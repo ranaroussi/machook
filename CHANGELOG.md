@@ -6,6 +6,25 @@ All notable changes to Machook are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-25
+
+### Added
+
+- **Async endpoints.** Each endpoint now has an **Async** toggle. When enabled,
+  the HTTP caller receives **201 Created** with a `run_id` immediately, and
+  the command keeps running in the background. Async endpoints still respect
+  timeout, output cap, and concurrency limits; they just don't make the
+  caller wait. MCP tool calls also honor the flag and return an immediate
+  accepted result.
+- **Persistent execution log.** Every run is appended to
+  `~/Library/Logs/machook/executions.jsonl` as a JSON line containing stdout,
+  stderr, exit code, duration, status code, and an `async` flag. The in-memory
+  Recent runs ring is now hydrated from this store on launch, so history
+  survives relaunch and async completions remain inspectable. The log rotates
+  at 10 MB.
+- **Log viewer.** Settings → General → Recent runs now shows an **async**
+  tag and an **Open log** button that reveals the log folder in Finder.
+
 ## [0.1.0] — 2026-09-10
 
 First release. A macOS menu bar app that runs local shell commands in response

@@ -131,6 +131,9 @@ public struct SettingsView: View {
                     if rule.mcpReadOnly {
                         tag("read-only")
                     }
+                    if rule.async {
+                        tag("async")
+                    }
                 }
                 Text(rule.command.isEmpty ? "(no command)" : rule.command)
                     .font(.caption.monospaced())
@@ -389,6 +392,8 @@ public struct SettingsView: View {
                     Text("Recent runs")
                         .font(.callout.weight(.semibold))
                     Spacer()
+                    Button("Open log") { openLogFolder() }
+                        .controlSize(.small)
                     if !log.entries.isEmpty {
                         Button("Clear") { log.clear() }
                             .controlSize(.small)
@@ -408,8 +413,13 @@ public struct SettingsView: View {
                                 Image(systemName: entry.succeeded ? "checkmark.circle.fill" : "xmark.circle.fill")
                                     .foregroundStyle(entry.succeeded ? .green : .red)
                                 VStack(alignment: .leading, spacing: 1) {
-                                    Text("\(entry.label)  ·  \(entry.source)")
-                                        .font(.caption.monospaced())
+                                    HStack(spacing: 4) {
+                                        Text("\(entry.label)  ·  \(entry.source)")
+                                            .font(.caption.monospaced())
+                                        if entry.async {
+                                            tag("async")
+                                        }
+                                    }
                                     if !entry.outputHead.isEmpty {
                                         Text(entry.outputHead)
                                             .font(.caption2)
@@ -517,6 +527,11 @@ public struct SettingsView: View {
             try? await Task.sleep(nanoseconds: 1_200_000_000)
             copied = false
         }
+    }
+
+    private func openLogFolder() {
+        let url = URL(fileURLWithPath: ExecutionLogStore.shared.logFilePath).deletingLastPathComponent()
+        NSWorkspace.shared.open(url)
     }
 
     /// Registers or removes the login item, reverting the toggle when the

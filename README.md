@@ -142,6 +142,30 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 **4. Point GitHub at it**: repository → Settings → Webhooks → your tunnel URL + `/deploy`.
 
+### Async endpoints
+
+By default the caller waits while your command runs, and a slow command
+returns **504**. For long-running work, turn on **Async** in the endpoint
+editor. The HTTP caller gets **201 Created** immediately, the command keeps
+running in the background, and the final result is written to the persistent
+execution log.
+
+```bash
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"ref":"refs/heads/main"}' \
+  https://<your-tunnel>/deploy
+
+# {"accepted":true,"run_id":"25bf2c35"}
+```
+
+The response body and the `X-Machook-Run-Id` header both carry the run id.
+You can watch the outcome in Settings → General → Recent runs, or in the
+log file at `~/Library/Logs/machook/executions.jsonl`.
+
+Async endpoints still respect **Timeout** and **Max concurrent commands**;
+they just don't make the HTTP client wait.
+
 ### Something to test against first
 
 Before wiring up anything real, [`examples/log-request.sh`](examples/log-request.sh)

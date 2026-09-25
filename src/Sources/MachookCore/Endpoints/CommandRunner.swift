@@ -85,12 +85,11 @@ public final class CommandRunner: @unchecked Sendable {
         }
         defer { slots.release() }
 
-        let envelopeURL: URL
-        do {
-            envelopeURL = try envelope.write()
-        } catch {
-            throw CommandRunError.envelopeWriteFailed(error.localizedDescription)
-        }
+        let (request, envelopeURL) = try Self.prepareRequest(
+            rule: rule,
+            envelope: envelope,
+            config: config
+        )
         defer {
             if config.keepRequestFiles {
                 Log.runner.info("kept request envelope at \(envelopeURL.path, privacy: .public)")
@@ -98,24 +97,6 @@ public final class CommandRunner: @unchecked Sendable {
                 try? FileManager.default.removeItem(at: envelopeURL)
             }
         }
-
-        let command: String
-        do {
-            command = try CommandTemplate.render(rule.command, envelopePath: envelopeURL.path)
-        } catch {
-            throw CommandRunError.badTemplate(error.localizedDescription)
-        }
-
-        let shell = config.shellPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        let request = ExecutionRequest(
-            command: command,
-            shell: shell.isEmpty ? "/bin/zsh" : shell,
-            loginShell: config.loginShell,
-            workingDirectory: rule.effectiveWorkingDirectory,
-            envelopeFile: envelopeURL.path,
-            outputCap: max(1, config.maxOutputKB) * 1024,
-            timeoutSeconds: max(1, rule.timeoutSeconds)
-        )
 
         Log.runner.info("run \(rule.path, privacy: .public) via \(request.shell, privacy: .public)")
 
@@ -131,6 +112,119 @@ public final class CommandRunner: @unchecked Sendable {
                     continuation.resume(throwing: error)
                 }
             }
+        }
+    }
+
+    /// Fire-and-forget variant. Returns the run id immediately; the command
+    /// keeps running on a background task and its result is written to the
+    /// persistent execution log when it finishes.
+    public func runAsync(
+        rule: EndpointRule,
+        envelope: RequestEnvelope,
+        config: AppConfig,
+        source: String = "http"
+    ) async throws -> String {
+        let limit = max(1, config.maxConcurrentRuns)
+        guard slots.acquire(limit: limit) else {
+            throw CommandRunError.atCapacity(limit: limit)
+        }
+
+        let (request, envelopeURL): (ExecutionRequest, URL)
+        do {
+            (request, envelopeURL) = try Self.prepareRequest(
+                rule: rule,
+                envelope: envelope,
+                config: config
+            )
+        } catch {
+            slots.release()
+            throw error
+        }
+
+        Log.runner.info("async run \(rule.path, privacy: .public) via \(request.shell, privacy: .public)")
+
+        Task.detached(priority: .userInitiated) {
+            do {
+                let result = try Self.execute(request)
+                self.slots.release()
+                self.cleanupEnvelope(envelopeURL: envelopeURL, keep: config.keepRequestFiles)
+
+                let statusCode = result.timedOut ? 504 : (result.exitCode == 0 ? 200 : 500)
+                ExecutionLog.post(
+                    id: envelope.id,
+                    source: source,
+                    label: rule.path,
+                    statusCode: statusCode,
+                    exitCode: result.exitCode,
+                    durationMs: result.durationMs,
+                    output: result.stdoutText,
+                    stderr: result.stderrText,
+                    async: true,
+                    timedOut: result.timedOut,
+                    stdoutTruncated: result.stdoutTruncated,
+                    stderrTruncated: result.stderrTruncated
+                )
+                Log.runner.info("async \(rule.path, privacy: .public) finished → \(statusCode, privacy: .public) in \(result.durationMs, privacy: .public)ms")
+            } catch {
+                self.slots.release()
+                self.cleanupEnvelope(envelopeURL: envelopeURL, keep: config.keepRequestFiles)
+                let message = (error as? CommandRunError)?.errorDescription ?? error.localizedDescription
+                ExecutionLog.post(
+                    id: envelope.id,
+                    source: source,
+                    label: rule.path,
+                    statusCode: 500,
+                    exitCode: -1,
+                    durationMs: 0,
+                    output: message,
+                    async: true
+                )
+                Log.runner.error("async \(rule.path, privacy: .public) failed: \(message, privacy: .public)")
+            }
+        }
+
+        return envelope.id
+    }
+
+    private static func prepareRequest(
+        rule: EndpointRule,
+        envelope: RequestEnvelope,
+        config: AppConfig
+    ) throws -> (ExecutionRequest, URL) {
+        let envelopeURL: URL
+        do {
+            envelopeURL = try envelope.write()
+        } catch {
+            throw CommandRunError.envelopeWriteFailed(error.localizedDescription)
+        }
+
+        let command: String
+        do {
+            command = try CommandTemplate.render(rule.command, envelopePath: envelopeURL.path)
+        } catch {
+            try? FileManager.default.removeItem(at: envelopeURL)
+            throw CommandRunError.badTemplate(error.localizedDescription)
+        }
+
+        let shell = config.shellPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let request = ExecutionRequest(
+            command: command,
+            shell: shell.isEmpty ? "/bin/zsh" : shell,
+            loginShell: config.loginShell,
+            workingDirectory: rule.effectiveWorkingDirectory,
+            envelopeFile: envelopeURL.path,
+            outputCap: max(1, config.maxOutputKB) * 1024,
+            timeoutSeconds: max(1, rule.timeoutSeconds)
+        )
+
+        return (request, envelopeURL)
+    }
+
+    private func cleanupEnvelope(envelopeURL: URL, keep: Bool) {
+        if keep {
+            Log.runner.info("kept request envelope at \(envelopeURL.path, privacy: .public)")
+        } else {
+            try? FileManager.default.removeItem(at: envelopeURL)
         }
     }
 
