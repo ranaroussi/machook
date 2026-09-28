@@ -367,8 +367,10 @@ SIGKILL two seconds later if it ignored it.
   endpoint editor. The HTTP caller gets **201 Created** immediately,
   the command keeps running in the background, and the result is
   written to `~/Library/Logs/machook/executions.jsonl` when it finishes.
-  Async endpoints still respect Timeout and Max concurrent commands;
-  they just don't make the caller wait.
+  **Async endpoints have no timeout at all** — the wall clock is only
+  there to stop a synchronous caller hanging, and an async caller already
+  has its answer. Async runs are still bounded by Max concurrent
+  commands, and by the output cap.
 - **Or do it yourself** if you need custom orchestration: have the
   command hand the envelope to a background job and exit immediately:
   `cp "$1" ~/queue/ && echo '{"accepted":true}'`. That also frees the
@@ -889,8 +891,8 @@ Two more gotchas:
 |------|-------|
 | Settings | `UserDefaults` domain `com.machook.app`, key `machook.config.v1` (a JSON blob) — `~/Library/Preferences/com.machook.app.plist` |
 | Request envelopes | `$TMPDIR/machook/requests/` (`getconf DARWIN_USER_TEMP_DIR`), mode `0700`, files `0600`, deleted after each run |
-| Recent runs | Memory only, last 100, cleared on relaunch |
-| Execution log | `~/Library/Logs/machook/executions.jsonl` — persistent JSON-lines record of every run, including async completions |
+| Recent runs | In-memory, last 100, hydrated from the execution log at launch |
+| Execution log | `~/Library/Logs/machook/executions.jsonl` — persistent JSON-lines record of every run, including async completions. `outcome` carries the result (`accepted`, `succeeded`, `failed`, `timed out`, `rejected`); `statusCode` is what the caller was told. Rotated at 10 MB |
 | App bundle | `/Applications/Machook.app`, or `./Machook.app` for a dev build |
 | Bundled cloudflared | `Machook.app/Contents/Resources/cloudflared` (release builds) |
 | Login item | Registered via `SMAppService`; System Settings → General → Login Items |

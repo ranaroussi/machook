@@ -20,8 +20,13 @@ public final class ExecutionLog: ObservableObject {
         public let durationMs: Int
         public let outputHead: String
         public let async: Bool
+        public let outcome: RunOutcome
 
-        public var succeeded: Bool { statusCode < 400 }
+        /// The command itself finished cleanly.
+        public var succeeded: Bool { outcome == .succeeded }
+
+        /// An async run we have acknowledged but not yet seen finish.
+        public var awaitingResult: Bool { outcome == .accepted }
     }
 
     private let capacity = 100
@@ -42,7 +47,8 @@ public final class ExecutionLog: ObservableObject {
                 exitCode: record.exitCode,
                 durationMs: record.durationMs,
                 outputHead: Self.head(of: record.stdout, fallback: record.stderr),
-                async: record.async
+                async: record.async,
+                outcome: record.outcome
             )
         }
     }
@@ -59,10 +65,17 @@ public final class ExecutionLog: ObservableObject {
         async: Bool = false,
         timedOut: Bool = false,
         stdoutTruncated: Bool = false,
-        stderrTruncated: Bool = false
+        stderrTruncated: Bool = false,
+        outcome: RunOutcome? = nil
     ) {
         let head = Self.head(of: output, fallback: stderr)
         let now = Date()
+        let resolved = outcome ?? RunOutcome.inferred(
+            async: async,
+            timedOut: timedOut,
+            statusCode: statusCode,
+            exitCode: exitCode
+        )
 
         entries.insert(
             Entry(
@@ -74,7 +87,8 @@ public final class ExecutionLog: ObservableObject {
                 exitCode: exitCode,
                 durationMs: durationMs,
                 outputHead: head,
-                async: async
+                async: async,
+                outcome: resolved
             ),
             at: 0
         )
@@ -95,7 +109,8 @@ public final class ExecutionLog: ObservableObject {
             stdoutTruncated: stdoutTruncated,
             stderrTruncated: stderrTruncated,
             async: async,
-            timedOut: timedOut
+            timedOut: timedOut,
+            outcome: resolved
         )
         ExecutionLogStore.shared.append(record)
     }
@@ -126,7 +141,8 @@ public final class ExecutionLog: ObservableObject {
         async: Bool = false,
         timedOut: Bool = false,
         stdoutTruncated: Bool = false,
-        stderrTruncated: Bool = false
+        stderrTruncated: Bool = false,
+        outcome: RunOutcome? = nil
     ) {
         Task { @MainActor in
             ExecutionLog.shared.record(
@@ -141,7 +157,8 @@ public final class ExecutionLog: ObservableObject {
                 async: async,
                 timedOut: timedOut,
                 stdoutTruncated: stdoutTruncated,
-                stderrTruncated: stderrTruncated
+                stderrTruncated: stderrTruncated,
+                outcome: outcome
             )
         }
     }

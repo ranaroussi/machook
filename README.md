@@ -163,8 +163,16 @@ The response body and the `X-Machook-Run-Id` header both carry the run id.
 You can watch the outcome in Settings → General → Recent runs, or in the
 log file at `~/Library/Logs/machook/executions.jsonl`.
 
-Async endpoints still respect **Timeout** and **Max concurrent commands**;
-they just don't make the HTTP client wait.
+**Async endpoints have no timeout**, so a long job runs until it exits on
+its own. The **Timeout** field still applies to synchronous endpoints and
+to the editor's **Test** button. Async runs remain bounded by **Max
+concurrent commands**, so raise that limit if you expect several long jobs
+at once.
+
+The log gets two lines per async run: an `accepted` acknowledgement, then
+the real `outcome` (`succeeded`, `failed`, or `timed out`). Read `outcome`,
+not `statusCode` — an async run's status is always `201`, because that is
+what the caller was told.
 
 ### Something to test against first
 
@@ -246,7 +254,8 @@ Each row in the endpoint table has these fields:
 | `command` | — | Shell command template. `{{request}}` is substituted with the envelope path; no other placeholder is supported. |
 | `methods` | `POST` | Accepted verbs. Empty means any of GET, POST, PUT, PATCH, DELETE. |
 | `enabled` | on | Off returns `503` instead of `404`, so a disabled endpoint is distinguishable from a typo. |
-| `timeoutSeconds` | `30` | Wall clock. On expiry: SIGTERM, then SIGKILL two seconds later, and the caller gets `504`. Range 1–3600. |
+| `timeoutSeconds` | `30` | Wall clock for synchronous endpoints. On expiry: SIGTERM, then SIGKILL two seconds later, and the caller gets `504`. Range 1–3600. Ignored while `async` is on. |
+| `async` | off | Return `201 Created` immediately and run the command in the background, with no timeout. The result is written to the execution log. |
 | `workingDirectory` | `$HOME` | Must exist, or the endpoint is refused at save time and at request time. |
 | `toolDescription` | — | Human description, and the text an AI model reads when deciding whether to call the tool. |
 | `mcpEnabled` | on | Whether this endpoint appears in `tools/list`. |

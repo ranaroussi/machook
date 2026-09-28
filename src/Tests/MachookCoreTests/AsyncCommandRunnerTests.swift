@@ -72,7 +72,10 @@ final class AsyncCommandRunnerTests: XCTestCase {
         }
 
         XCTAssertNotNil(record, "async result was not logged")
-        XCTAssertEqual(record?.statusCode, 200)
+        // The caller was told 201; the completion record keeps that status
+        // and reports the real result through `outcome`.
+        XCTAssertEqual(record?.statusCode, 201)
+        XCTAssertEqual(record?.outcome, .succeeded)
         XCTAssertEqual(record?.async, true)
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker), "command did not finish")
     }
@@ -101,9 +104,74 @@ final class AsyncCommandRunnerTests: XCTestCase {
         }
 
         XCTAssertNotNil(record)
-        XCTAssertEqual(record?.statusCode, 500)
+        XCTAssertEqual(record?.outcome, .failed)
+        XCTAssertEqual(record?.statusCode, 201, "the caller's 201 is what the run's HTTP status was")
         XCTAssertEqual(record?.exitCode, 7)
         XCTAssertTrue(record?.stderr.contains("bad") ?? false)
+    }
+
+    /// An async endpoint has already answered its caller, so the wall clock
+    /// no longer has anyone to rescue. Killing the command at the endpoint's
+    /// timeout would defeat the reason async mode exists: long jobs. This is
+    /// the regression that produced a 504 in the log for a run whose caller
+    /// had been told 201.
+    func testAsyncRunIsNotKilledByTheEndpointTimeout() async throws {
+        let runner = CommandRunner()
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("machook-async-notimeout-\(UUID().uuidString)")
+            .path
+        defer { try? FileManager.default.removeItem(atPath: marker) }
+
+        // Timeout of 1s, command that needs about 3s.
+        let rule = EndpointRule(
+            path: "/async-long",
+            command: "sleep 3 && touch \(marker)",
+            timeoutSeconds: 1,
+            async: true
+        )
+
+        let runID = try await runner.runAsync(
+            rule: rule,
+            envelope: makeEnvelope(path: "/async-long"),
+            config: makeConfig()
+        )
+
+        let deadline = Date().addingTimeInterval(10)
+        var record: ExecutionRecord?
+        while Date() < deadline {
+            record = ExecutionLogStore.shared.readRecent(maxEntries: 10).first { $0.id == runID }
+            if record != nil { break }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+
+        XCTAssertNotNil(record, "async run was never logged")
+        XCTAssertFalse(record?.timedOut ?? true, "async run must not be killed by the endpoint timeout")
+        XCTAssertEqual(record?.outcome, .succeeded)
+        XCTAssertEqual(record?.exitCode, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker), "command was cut short")
+    }
+
+    /// The escape hatch still holds: a synchronous run keeps its timeout.
+    /// The Settings Test button takes this path even for an async draft, so
+    /// the limit must survive outside `runAsync`.
+    func testSynchronousRunStillHonoursTheTimeout() async throws {
+        let runner = CommandRunner()
+        let rule = EndpointRule(
+            path: "/sync-long",
+            command: "sleep 5",
+            timeoutSeconds: 1,
+            async: true
+        )
+
+        let result = try await runner.run(
+            rule: rule,
+            envelope: makeEnvelope(path: "/sync-long"),
+            config: makeConfig()
+        )
+
+        XCTAssertTrue(result.timedOut)
+        XCTAssertFalse(result.succeeded)
+        XCTAssertLessThan(result.durationMs, 4000, "should have been killed near the 1s limit, not run to completion")
     }
 
     func testAsyncRunRespectsConcurrencyLimit() async throws {

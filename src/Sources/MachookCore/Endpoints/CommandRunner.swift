@@ -88,7 +88,8 @@ public final class CommandRunner: @unchecked Sendable {
         let (request, envelopeURL) = try Self.prepareRequest(
             rule: rule,
             envelope: envelope,
-            config: config
+            config: config,
+            timeoutSeconds: max(1, rule.timeoutSeconds)
         )
         defer {
             if config.keepRequestFiles {
@@ -134,7 +135,12 @@ public final class CommandRunner: @unchecked Sendable {
             (request, envelopeURL) = try Self.prepareRequest(
                 rule: rule,
                 envelope: envelope,
-                config: config
+                config: config,
+                // No wall clock: the caller already has its 201, so
+                // nothing is waiting on this. Applying the endpoint's
+                // limit here would kill exactly the long jobs async mode
+                // exists for. The concurrency budget bounds these runs.
+                timeoutSeconds: nil
             )
         } catch {
             slots.release()
@@ -149,12 +155,16 @@ public final class CommandRunner: @unchecked Sendable {
                 self.slots.release()
                 self.cleanupEnvelope(envelopeURL: envelopeURL, keep: config.keepRequestFiles)
 
-                let statusCode = result.timedOut ? 504 : (result.exitCode == 0 ? 200 : 500)
+                let outcome: RunOutcome = result.timedOut ? .timedOut : (result.exitCode == 0 ? .succeeded : .failed)
                 ExecutionLog.post(
                     id: envelope.id,
                     source: source,
                     label: rule.path,
-                    statusCode: statusCode,
+                    // The caller was told 201 the moment we accepted this;
+                    // that is what the HTTP status for this run was, and it
+                    // stays true however the command ends. `outcome`
+                    // carries the result.
+                    statusCode: 201,
                     exitCode: result.exitCode,
                     durationMs: result.durationMs,
                     output: result.stdoutText,
@@ -162,9 +172,10 @@ public final class CommandRunner: @unchecked Sendable {
                     async: true,
                     timedOut: result.timedOut,
                     stdoutTruncated: result.stdoutTruncated,
-                    stderrTruncated: result.stderrTruncated
+                    stderrTruncated: result.stderrTruncated,
+                    outcome: outcome
                 )
-                Log.runner.info("async \(rule.path, privacy: .public) finished → \(statusCode, privacy: .public) in \(result.durationMs, privacy: .public)ms")
+                Log.runner.info("async \(rule.path, privacy: .public) finished → \(outcome.rawValue, privacy: .public) in \(result.durationMs, privacy: .public)ms")
             } catch {
                 self.slots.release()
                 self.cleanupEnvelope(envelopeURL: envelopeURL, keep: config.keepRequestFiles)
@@ -173,11 +184,12 @@ public final class CommandRunner: @unchecked Sendable {
                     id: envelope.id,
                     source: source,
                     label: rule.path,
-                    statusCode: 500,
+                    statusCode: 201,
                     exitCode: -1,
                     durationMs: 0,
                     output: message,
-                    async: true
+                    async: true,
+                    outcome: .rejected
                 )
                 Log.runner.error("async \(rule.path, privacy: .public) failed: \(message, privacy: .public)")
             }
@@ -189,7 +201,8 @@ public final class CommandRunner: @unchecked Sendable {
     private static func prepareRequest(
         rule: EndpointRule,
         envelope: RequestEnvelope,
-        config: AppConfig
+        config: AppConfig,
+        timeoutSeconds: Int?
     ) throws -> (ExecutionRequest, URL) {
         let envelopeURL: URL
         do {
@@ -214,7 +227,7 @@ public final class CommandRunner: @unchecked Sendable {
             workingDirectory: rule.effectiveWorkingDirectory,
             envelopeFile: envelopeURL.path,
             outputCap: max(1, config.maxOutputKB) * 1024,
-            timeoutSeconds: max(1, rule.timeoutSeconds)
+            timeoutSeconds: timeoutSeconds
         )
 
         return (request, envelopeURL)
@@ -237,7 +250,9 @@ public final class CommandRunner: @unchecked Sendable {
         let workingDirectory: String
         let envelopeFile: String
         let outputCap: Int
-        let timeoutSeconds: Int
+        /// `nil` means no wall-clock limit — the command runs until it
+        /// exits on its own.
+        let timeoutSeconds: Int?
     }
 
     /// Mutable state shared with the drain threads and the timeout timer.
@@ -316,7 +331,8 @@ public final class CommandRunner: @unchecked Sendable {
             state.setStderr(data, truncated: truncated)
         }
 
-        // Timeout: SIGTERM, then SIGKILL two seconds later.
+        // Timeout: SIGTERM, then SIGKILL two seconds later. Absent for an
+        // async endpoint, which opted out of the wall clock entirely.
         //
         // Only the direct child is signalled. `zsh -c` execs a single
         // simple command, so for the common one-command template that
@@ -324,26 +340,30 @@ public final class CommandRunner: @unchecked Sendable {
         // own can still leave a grandchild running after a timeout. We
         // deliberately do not `kill(-pid)`: Process gives the child our
         // own process group, so a negative pid would signal Machook too.
-        let processBox = Box(process)
-        let killer = DispatchWorkItem {
-            guard processBox.value.isRunning else { return }
-            state.markTimedOut()
-            Log.runner.notice("command exceeded \(request.timeoutSeconds, privacy: .public)s, sending SIGTERM")
-            processBox.value.terminate()
-            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                if processBox.value.isRunning {
-                    Log.runner.notice("command ignored SIGTERM, sending SIGKILL")
-                    kill(processBox.value.processIdentifier, SIGKILL)
+        var killer: DispatchWorkItem?
+        if let timeoutSeconds = request.timeoutSeconds {
+            let processBox = Box(process)
+            let item = DispatchWorkItem {
+                guard processBox.value.isRunning else { return }
+                state.markTimedOut()
+                Log.runner.notice("command exceeded \(timeoutSeconds, privacy: .public)s, sending SIGTERM")
+                processBox.value.terminate()
+                DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                    if processBox.value.isRunning {
+                        Log.runner.notice("command ignored SIGTERM, sending SIGKILL")
+                        kill(processBox.value.processIdentifier, SIGKILL)
+                    }
                 }
             }
+            killer = item
+            DispatchQueue.global().asyncAfter(
+                deadline: .now() + .seconds(timeoutSeconds),
+                execute: item
+            )
         }
-        DispatchQueue.global().asyncAfter(
-            deadline: .now() + .seconds(request.timeoutSeconds),
-            execute: killer
-        )
 
         process.waitUntilExit()
-        killer.cancel()
+        killer?.cancel()
 
         // Normally both pipes hit EOF the moment the child exits. A
         // grandchild that inherited stdout keeps them open, so cap the

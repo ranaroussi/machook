@@ -6,6 +6,30 @@ All notable changes to Machook are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Async endpoints no longer have a timeout.** The wall-clock limit exists
+  to stop a synchronous caller hanging, and an async caller already holds
+  its `201`. Applying the endpoint's `Timeout` anyway killed exactly the
+  long jobs async mode was turned on for: the log recorded a run the caller
+  was told was accepted, then a second line 30 seconds later marking it
+  `504` and SIGTERM'd. Async runs are still bounded by **Max concurrent
+  commands** and by the output cap. The `Timeout` field still applies to
+  synchronous endpoints and to the editor's **Test** button.
+- **Execution log records an `outcome`.** An async run's HTTP status is
+  always `201`, because that is what the caller was told, so `statusCode`
+  could not distinguish an accepted run from a finished, failed, or killed
+  one. Records now carry `outcome` (`accepted`, `succeeded`, `failed`,
+  `timed out`, `rejected`), and the menu bar and Settings key their glyph
+  off it. Older log lines without the field are decoded by inferring it, so
+  an existing log still reads back.
+
+### Fixed
+
+- The endpoint editor's Timeout help text claimed the limit applied to
+  async endpoints while saying it was ignored. It now states plainly that
+  it has no effect while Async is on.
+
 ## [0.2.0] — 2026-09-25
 
 ### Added

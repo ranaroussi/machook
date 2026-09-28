@@ -1,6 +1,52 @@
 import Foundation
 
-/// Persistent, append-only record of every command Machook runs.
+/// What actually became of a run.
+///
+/// `statusCode` alone cannot answer this. An async run produces two
+/// records, and in both of them the HTTP status the caller received is
+/// `201` — so a `504` on an async completion would read as though the
+/// caller had been told the request failed, when in fact it already had
+/// its answer. The outcome is what distinguishes "we accepted this" from
+/// "it later finished", "it later failed", and "we killed it".
+public enum RunOutcome: String, Codable, Sendable {
+    /// Async: the caller already got `201 Created`; the command is still running.
+    case accepted
+    /// The command ran and exited 0.
+    case succeeded
+    /// The command ran and exited non-zero.
+    case failed
+    /// The command was killed by the endpoint's wall-clock limit.
+    case timedOut
+    /// The command never ran: no concurrency slot, bad template, envelope
+    /// write failure, or spawn failure.
+    case rejected
+
+    /// Best-effort label for records written before this field existed.
+    static func inferred(async: Bool, timedOut: Bool, statusCode: Int, exitCode: Int32) -> RunOutcome {
+        if timedOut { return .timedOut }
+        if exitCode == 0 { return .succeeded }
+        // An accepted acknowledgement is the one record with no process
+        // behind it: nothing ran, so there is no exit status to report.
+        if async && statusCode == 201 && exitCode == -1 { return .accepted }
+        return .failed
+    }
+
+    /// Short label for the menu bar and Settings.
+    public var label: String {
+        switch self {
+        case .accepted: return "accepted"
+        case .succeeded: return "succeeded"
+        case .failed: return "failed"
+        case .timedOut: return "timed out"
+        case .rejected: return "not run"
+        }
+    }
+
+    /// False for the acknowledgement, which precedes the real result.
+    public var isTerminal: Bool { self != .accepted }
+}
+
+/// One line of the persistent execution log.
 ///
 /// The in-memory `ExecutionLog` is reset on relaunch. This store is not:
 /// it writes JSON lines to `~/Library/Logs/machook/executions.jsonl` so
@@ -11,6 +57,9 @@ public struct ExecutionRecord: Codable, Sendable, Identifiable {
     public let timestamp: Date
     public let source: String
     public let label: String
+    /// The HTTP status this run produced. For an async run that is `201`
+    /// in both the acknowledgement and the completion record: it is what
+    /// the caller was actually told. Read `outcome` for the result.
     public let statusCode: Int
     public let exitCode: Int32
     public let durationMs: Int
@@ -20,6 +69,7 @@ public struct ExecutionRecord: Codable, Sendable, Identifiable {
     public let stderrTruncated: Bool
     public let async: Bool
     public let timedOut: Bool
+    public let outcome: RunOutcome
 
     public init(
         id: String,
@@ -34,7 +84,8 @@ public struct ExecutionRecord: Codable, Sendable, Identifiable {
         stdoutTruncated: Bool,
         stderrTruncated: Bool,
         async: Bool,
-        timedOut: Bool
+        timedOut: Bool,
+        outcome: RunOutcome
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -49,6 +100,34 @@ public struct ExecutionRecord: Codable, Sendable, Identifiable {
         self.stderrTruncated = stderrTruncated
         self.async = async
         self.timedOut = timedOut
+        self.outcome = outcome
+    }
+
+    /// Hand-written because `outcome` arrived after the field was already
+    /// being written to disk: v0.2.0 and earlier lines have no such key,
+    /// and a log you cannot read back is worse than no log at all.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        timestamp = try c.decode(Date.self, forKey: .timestamp)
+        source = try c.decode(String.self, forKey: .source)
+        label = try c.decode(String.self, forKey: .label)
+        statusCode = try c.decode(Int.self, forKey: .statusCode)
+        exitCode = try c.decode(Int32.self, forKey: .exitCode)
+        durationMs = try c.decode(Int.self, forKey: .durationMs)
+        stdout = try c.decode(String.self, forKey: .stdout)
+        stderr = try c.decode(String.self, forKey: .stderr)
+        stdoutTruncated = try c.decode(Bool.self, forKey: .stdoutTruncated)
+        stderrTruncated = try c.decode(Bool.self, forKey: .stderrTruncated)
+        async = try c.decode(Bool.self, forKey: .async)
+        timedOut = try c.decode(Bool.self, forKey: .timedOut)
+        outcome = try c.decodeIfPresent(RunOutcome.self, forKey: .outcome)
+            ?? RunOutcome.inferred(
+                async: async,
+                timedOut: timedOut,
+                statusCode: statusCode,
+                exitCode: exitCode
+            )
     }
 }
 

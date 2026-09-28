@@ -25,12 +25,12 @@ whether it is a webhook POST or an MCP `tools/call`.
 | Settings "Test" button | `EndpointEditorView.runTest()` | `CommandRunner.run` on the unsaved draft |
 
 All three converge on `CommandRunner.run(rule:envelope:config:)` or its
-fire-and-forget counterpart `runAsync`. Both enforce the same timeout,
-output cap, and concurrency budget, and both write their final result
-to the persistent `ExecutionLogStore`.
-There is exactly one place a command can be spawned, which is also the
-only place the timeout, the output cap, and the concurrency budget are
-enforced.
+fire-and-forget counterpart `runAsync`. There is exactly one place a
+command can be spawned, and one place the output cap and the concurrency
+budget are enforced. Both paths write their final result to the persistent
+`ExecutionLogStore`; only the synchronous path enforces a timeout, because
+an async caller already holds its `201` and there is nobody left for a
+deadline to rescue.
 
 **Machook requires no macOS permissions.** It reads no protected data,
 scripts no other app, and touches no TCC-guarded resource. There is no
@@ -293,6 +293,42 @@ Two mapping decisions that are easy to misread:
 Error bodies are serialized `withoutEscapingSlashes`, because these
 messages quote endpoint paths and `"\/deploy"` reads like a typo.
 
+### Async endpoints
+
+An endpoint with `async` on skips the whole mapping above. `dispatch`
+calls `CommandRunner.runAsync`, which claims a concurrency slot, stages
+the envelope, hands the work to a detached task, and returns the run id.
+The caller gets `201 Created` with `{"accepted":true,"run_id":…}` and an
+`X-Machook-Run-Id` header without waiting for the shell.
+
+The design question worth recording is the timeout. **An async run has
+none.** The wall clock exists to protect a synchronous caller from
+hanging: a webhook provider is waiting on a socket, and a command that
+never returns would hold it open forever. Once the caller has its `201`,
+that reason is gone. Applying the endpoint's `timeoutSeconds` anyway would
+kill the long jobs async mode was turned on for, which is exactly what
+happened before: the log showed a run the caller was told was accepted
+(`201`) and a completion record of `504`, because the 30-second SIGTERM
+fired anyway. So `prepareRequest` takes `timeoutSeconds: Int?`, `run`
+passes the rule's limit, and `runAsync` passes `nil`.
+
+Two consequences follow, and neither is hidden:
+
+- **The concurrency budget is the real bound.** A wedged async command
+  holds its slot until it exits. With the default `maxConcurrentRuns` of 4,
+  three stuck jobs are enough to start rejecting new work with `503`, so
+  raise the limit deliberately rather than by accident. The editor help
+  text says the timeout does nothing while Async is on, rather than
+  implying a limit that isn't applied.
+- **`statusCode` cannot double as the result.** An async run produces two
+  log records and both carry `201`, because that is what the caller was
+  told. The result lives in `RunOutcome`: `accepted` for the
+  acknowledgement, then `succeeded`, `failed`, or `timedOut` (or
+  `rejected` when the command never ran at all). The menu bar and Settings
+  key their glyph off `outcome`, not the status code. `ExecutionRecord`
+  decodes `outcome` with `decodeIfPresent` and infers it for lines written
+  before the field existed, so a pre-existing log still reads back.
+
 ### `GET /status`
 
 ```json
@@ -463,7 +499,8 @@ Per endpoint (`EndpointRule`):
 | `command` | `""` | The only string the shell parses |
 | `methods` | `["POST"]` | Empty accepts any method; comparison is case-insensitive |
 | `enabled` | `true` | Disabled → `503`, distinguishable from `404` |
-| `timeoutSeconds` | `30` | Validated 1–3600 |
+| `timeoutSeconds` | `30` | Validated 1–3600. Ignored while `async` is on |
+| `async` | `false` | `201` immediately, no timeout, result written to the log |
 | `workingDirectory` | `""` | Empty → `NSHomeDirectory()`; `~` expanded; must exist |
 | `toolDescription` | `""` | Doubles as the MCP tool description |
 | `mcpEnabled` | `true` | Off for provider-driven hooks an agent shouldn't invoke |
@@ -521,7 +558,8 @@ Six mechanics, each of which exists because of a specific failure:
    for the same reason — stopping early leaves the child blocked on a
    full pipe. The run still completes, and the response gets
    `X-Machook-Truncated: true`.
-5. **Timeout escalates SIGTERM → SIGKILL after 2 s.** Only the direct
+5. **Timeout escalates SIGTERM → SIGKILL after 2 s, and is skipped
+   entirely for async runs.** Only the direct
    child is signalled. `zsh -c` execs a single simple command, so for the
    common one-command template that child *is* the script; a script that
    backgrounds work of its own can still leave a grandchild alive.
@@ -548,8 +586,8 @@ isolation boundary.
 ### Recent runs
 
 `ExecutionLog` is a `@MainActor` ring buffer of the last 100 runs
-(source, label, status code, exit code, duration, first line of output
-truncated to 120 chars). Both surfaces post to it. It is backed by
+(source, label, status code, exit code, duration, outcome, first line of
+output truncated to 120 chars). Both surfaces post to it. It is backed by
 `ExecutionLogStore`, which appends every run to
 `~/Library/Logs/machook/executions.jsonl` as a JSON line. The persistent
 store matters for async runs: the HTTP response returns before the
@@ -644,7 +682,8 @@ approval-gating it on every call.
 | runner error (capacity, bad template, …) | `isError: true` with the runner's message |
 
 The same runs are recorded in `ExecutionLog` with a synthetic status code
-(200/500/504) so the menu bar treats HTTP and MCP traffic identically.
+(200/500/504) and a `RunOutcome`, so the menu bar treats HTTP and MCP
+traffic identically.
 
 ---
 
@@ -1011,9 +1050,10 @@ belong in this codebase:
 
 - Scripting languages, DSLs, or a workflow builder — the command is your
   script, in whatever language you like.
-- Retry queues and delivery guarantees. A request runs once,
-  synchronously, and the caller learns the outcome from the status code.
-  Webhook providers already retry.
+- Retry queues and delivery guarantees. A request runs once. The caller
+  learns the outcome from the status code, or, for an async endpoint, from
+  the execution log once the 201 has been handed back. Webhook providers
+  already retry.
 - Request signature verification (GitHub HMAC, Stripe signatures). The
   envelope carries the headers and the raw body; verifying them is three
   lines in your script and stays out of Machook's trust decisions.

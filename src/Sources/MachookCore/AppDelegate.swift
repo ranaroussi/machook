@@ -374,8 +374,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
             menu.addItem(.separator())
             menu.addItem(.titled("Recent"))
             for entry in recent {
-                let glyph = entry.succeeded ? "✓" : "✗"
-                let title = "   \(glyph) \(entry.label) · \(entry.statusCode) · \(entry.durationMs)ms"
+                let glyph: String
+                switch entry.outcome {
+                case .accepted:  glyph = "…"
+                case .succeeded: glyph = "✓"
+                case .failed, .timedOut, .rejected: glyph = "✗"
+                }
+                let title = "   \(glyph) \(entry.label) · \(entry.outcome.label) · \(entry.durationMs)ms"
                 let item = NSMenuItem.titled(title)
                 if !entry.outputHead.isEmpty { item.toolTip = entry.outputHead }
                 menu.addItem(item)

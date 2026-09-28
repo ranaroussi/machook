@@ -410,14 +410,17 @@ public struct SettingsView: View {
                         ForEach(Array(log.entries.prefix(12).enumerated()), id: \.element.id) { index, entry in
                             if index > 0 { rowDivider }
                             HStack(spacing: 8) {
-                                Image(systemName: entry.succeeded ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                    .foregroundStyle(entry.succeeded ? .green : .red)
+                                Image(systemName: Self.symbol(for: entry.outcome))
+                                    .foregroundStyle(Self.tint(for: entry.outcome))
                                 VStack(alignment: .leading, spacing: 1) {
                                     HStack(spacing: 4) {
                                         Text("\(entry.label)  ·  \(entry.source)")
                                             .font(.caption.monospaced())
                                         if entry.async {
                                             tag("async")
+                                        }
+                                        if entry.outcome != .succeeded {
+                                            tag(entry.outcome.label)
                                         }
                                     }
                                     if !entry.outputHead.isEmpty {
@@ -428,7 +431,7 @@ public struct SettingsView: View {
                                     }
                                 }
                                 Spacer()
-                                Text("\(entry.statusCode) · \(entry.durationMs)ms")
+                                Text(Self.trailingSummary(for: entry))
                                     .font(.caption2.monospaced())
                                     .foregroundStyle(.secondary)
                             }
@@ -650,6 +653,40 @@ public struct SettingsView: View {
 
     private static func shortVersion() -> String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+    }
+
+    /// Outcome drives the glyph, not the HTTP status. An async run's status
+    /// is always 201 — the caller's acknowledgement — so it says nothing
+    /// about whether the command later succeeded.
+    private static func symbol(for outcome: RunOutcome) -> String {
+        switch outcome {
+        case .accepted:  return "clock"
+        case .succeeded: return "checkmark.circle.fill"
+        case .failed:    return "xmark.circle.fill"
+        case .timedOut:  return "clock.badge.exclamationmark"
+        case .rejected:  return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private static func tint(for outcome: RunOutcome) -> Color {
+        switch outcome {
+        case .accepted:  return .orange
+        case .succeeded: return .green
+        case .failed, .timedOut: return .red
+        case .rejected:  return .orange
+        }
+    }
+
+    /// The plain status code is the useful number for a synchronous run;
+    /// for an async one the code is a constant 201 and the outcome is what
+    /// you actually want to read.
+    private static func trailingSummary(for entry: ExecutionLog.Entry) -> String {
+        if entry.async {
+            return entry.outcome == .accepted
+                ? entry.outcome.label
+                : "\(entry.outcome.label) · \(entry.durationMs)ms"
+        }
+        return "\(entry.statusCode) · \(entry.durationMs)ms"
     }
 
     private static func buildNumber() -> String {

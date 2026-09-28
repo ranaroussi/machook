@@ -161,7 +161,8 @@ public final class MCPService {
                     exitCode: -1,
                     durationMs: 0,
                     output: "Accepted async run \(runID)",
-                    async: true
+                    async: true,
+                    outcome: .accepted
                 )
                 return .init(
                     content: [.text(text: "Accepted run \(runID). The command is running in the background.", annotations: nil, _meta: nil)],
@@ -183,7 +184,8 @@ public final class MCPService {
                 async: false,
                 timedOut: result.timedOut,
                 stdoutTruncated: result.stdoutTruncated,
-                stderrTruncated: result.stderrTruncated
+                stderrTruncated: result.stderrTruncated,
+                outcome: result.timedOut ? .timedOut : (result.exitCode == 0 ? .succeeded : .failed)
             )
             Log.mcp.info("tool \(match.toolName, privacy: .public) → \(statusCode, privacy: .public) in \(result.durationMs, privacy: .public)ms")
 
@@ -208,7 +210,8 @@ public final class MCPService {
                 statusCode: 500,
                 exitCode: -1,
                 durationMs: 0,
-                output: message
+                output: message,
+                outcome: .rejected
             )
             return error(message)
         } catch {

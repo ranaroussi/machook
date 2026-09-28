@@ -84,7 +84,7 @@ log show   --predicate 'subsystem == "com.machook.app"' --info --last 5m
 ## 3. The test fixture
 
 Every example below assumes port `7876`, bearer token `test-token`, and
-these six endpoints.
+these endpoints.
 
 | Path | Command | Methods | Timeout | Enabled | Exercises |
 |------|---------|---------|---------|---------|-----------|
@@ -94,6 +94,7 @@ these six endpoints.
 | `/boom` | `echo bad >&2; exit 7` | POST | 30 | yes | Non-zero exit → 500 |
 | `/slow` | `sleep 5` | POST | 1 | yes | Timeout → 504 |
 | `/async` | `sleep 2; echo done` | POST | 30 | yes | Async → 201, then log |
+| `/slow-async` | `sleep 5; echo done` | POST | 1 | yes | async: timeout does not kill it |
 | `/off` | `echo nope` | POST | 30 | **no** | Disabled → 503 |
 
 ### Option A — the GUI
@@ -159,6 +160,7 @@ config = {
         ep("/boom",  "echo bad >&2; exit 7"),
         ep("/slow",  "sleep 5", timeout=1),
         ep("/async", "sleep 2; echo done", async=True),
+        ep("/slow-async", "sleep 5; echo done", timeout=1, async=True),
         ep("/off",   "echo nope", enabled=False),
     ],
 }
@@ -278,10 +280,20 @@ curl -sS -i "${AUTH[@]}" -d '{}' "$BASE/async" | head -10
 # HTTP/1.1 201 Created
 # X-Machook-Run-Id: ...
 # {"accepted":true,"run_id":"..."}
-# Wait for it, then confirm the log:
+# Wait for it, then confirm the log. Two lines share the run id: the
+# acceptance, then the result. Read `outcome`, not `statusCode`.
 sleep 3
-tail -1 ~/Library/Logs/machook/executions.jsonl | jq '{statusCode, exitCode, stdout, async}'
-# { "statusCode": 200, "exitCode": 0, "stdout": "done\n", "async": true }
+tail -2 ~/Library/Logs/machook/executions.jsonl | jq '{id, statusCode, exitCode, stdout, async, outcome}'
+# {"id":"…","statusCode":201,"exitCode":null/…,"stdout":"Accepted run …","async":true,"outcome":"accepted"}
+# {"id":"…","statusCode":201,"exitCode":0,"stdout":"done\n","async":true,"outcome":"succeeded"}
+
+# Async ignores the endpoint timeout — `/slow-async` sleeps 5s but has a
+# 1s timeout, and must still run to completion.
+curl -sS -o /dev/null -w '%{http_code}\n' "${AUTH[@]}" -d '{}' "$BASE/slow-async"
+# 201
+sleep 6
+tail -1 ~/Library/Logs/machook/executions.jsonl | jq '{statusCode, exitCode, outcome}'
+# {"statusCode":201,"exitCode":0,"outcome":"succeeded"}
 
 # Unknown path — note this needs a VALID token; auth runs before routing
 curl -sS -w '\n%{http_code}\n' "${AUTH[@]}" -d '{}' "$BASE/nope"

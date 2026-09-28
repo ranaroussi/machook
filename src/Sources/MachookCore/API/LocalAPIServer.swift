@@ -286,7 +286,8 @@ public final class LocalAPIServer: @unchecked Sendable {
                     exitCode: -1,
                     durationMs: 0,
                     output: "Accepted run \(runID)",
-                    async: true
+                    async: true,
+                    outcome: .accepted
                 )
                 return acceptedResponse(runID: runID)
             } catch let error as CommandRunError {
@@ -306,7 +307,8 @@ public final class LocalAPIServer: @unchecked Sendable {
                     statusCode: Int(status.code),
                     exitCode: -1,
                     durationMs: 0,
-                    output: message
+                    output: message,
+                    outcome: .rejected
                 )
                 return problem(status, message)
             } catch {
@@ -336,7 +338,8 @@ public final class LocalAPIServer: @unchecked Sendable {
                 statusCode: Int(status.code),
                 exitCode: -1,
                 durationMs: 0,
-                output: message
+                output: message,
+                outcome: .rejected
             )
             return problem(status, message)
         } catch {
@@ -398,7 +401,8 @@ public final class LocalAPIServer: @unchecked Sendable {
             async: false,
             timedOut: result.timedOut,
             stdoutTruncated: result.stdoutTruncated,
-            stderrTruncated: result.stderrTruncated
+            stderrTruncated: result.stderrTruncated,
+            outcome: result.timedOut ? .timedOut : (result.exitCode == 0 ? .succeeded : .failed)
         )
 
         var response = Response(status: status, body: .init(byteBuffer: ByteBuffer(data: payload)))
