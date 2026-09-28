@@ -6,6 +6,16 @@
         <description>Auto-update feed for Machook (macOS menu bar app).</description>
         <language>en</language>
         <item>
+            <title>Version 0.2.1</title>
+            <pubDate>Mon, 28 Sep 2026 11:07:02 +0000</pubDate>
+            <link>https://github.com/ranaroussi/machook/releases/tag/v0.2.1</link>
+            <sparkle:releaseNotesLink>https://github.com/ranaroussi/machook/releases/tag/v0.2.1</sparkle:releaseNotesLink>
+            <sparkle:version>0.2.1</sparkle:version>
+            <sparkle:shortVersionString>0.2.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/ranaroussi/machook/releases/download/v0.2.1/machook-universal.zip" length="57844914" type="application/octet-stream" sparkle:edSignature="ruVJ/JyCG2FyeazyIshwwhWEnyFOhk2Jkln/FrYpFI2vqjaUq1YETQYbq4kWtx3QVWkIdqFfCKfpQRK81Wb6BQ==" />
+        </item>
+        <item>
             <title>Version 0.2.0</title>
             <pubDate>Fri, 25 Sep 2026 16:22:33 +0000</pubDate>
             <link>https://github.com/ranaroussi/machook/releases/tag/v0.2.0</link>
