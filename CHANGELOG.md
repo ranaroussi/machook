@@ -6,6 +6,8 @@ All notable changes to Machook are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-09-28
+
 ### Changed
 
 - **Async endpoints no longer have a timeout.** The wall-clock limit exists
